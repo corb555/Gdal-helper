@@ -13,7 +13,7 @@ def get_git_hash() -> str:
     appends a '-dirty' suffix to the hash.
 
     Returns:
-        The git commit hash string, or "unknown" if not in a git repository.
+        The git commit hash string, or None if not in a git repository.
     """
     try:
         # Get the full commit hash
@@ -27,29 +27,32 @@ def get_git_hash() -> str:
             ["git", "status", "--porcelain"], capture_output=True, text=True, check=True
         )
         if status_process.stdout:
-            print("⚠️ Warning: Git repository has uncommitted changes.")
             git_hash += "-dirty"
 
         return git_hash
 
     except (subprocess.CalledProcessError, FileNotFoundError):
         # Handle cases where git is not installed or this is not a git repo
-        print("⚠️ Warning: Could not get git hash. Not a git repository or git is not installed.")
-        return "unknown"
+        return None
 
 
-def set_geotiff_version(filepath: str, version_hash: str):
+def set_tiff_version(filepath: str, version_hash: str):
     """
+    Embeds a version hash into a TIFF's metadata using gdal_edit.py.
 
-    Embeds a version hash into a GeoTIFF's metadata using gdal_edit.py.
-
-    This modifies the file in-place.
+    This modifies the file in-place. Note: This only supports TIFFs (.tif).
+    Other formats will be skipped with a warning.
 
     Args:
-        filepath: The path to the GeoTIFF file to be updated.
+        filepath: The path to the TIFF file to be updated.
         version_hash: The version string (e.g., a git hash) to embed.
     """
-    print(f"  Stamping version '{version_hash[:12]}...' into '{filepath}'")
+    # Simple check for TIF extension
+    if not filepath.lower().endswith(('.tif', '.tiff')):
+        raise RuntimeError(
+            f"❌ Failed to set version metadata on {filepath}. Not a TIFF"
+        )
+
     try:
         metadata_tag = f"VERSION={version_hash}"
         command = ["gdal_edit.py", "-mo", metadata_tag, filepath]
@@ -58,26 +61,31 @@ def set_geotiff_version(filepath: str, version_hash: str):
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         stderr = e.stderr.strip() if hasattr(e, 'stderr') else 'Is gdal_edit.py in your PATH?'
         raise RuntimeError(
-            f"❌ Failed to set version metadata on {filepath}.\n   --- STDERR ---\n{stderr}"
-            )
+            f"❌ Failed to set version metadata on {filepath}.\n{stderr}"
+        )
 
 
-def get_geotiff_version(filepath: str) -> Optional[str]:
+def get_tiff_version(filepath: str) -> Optional[str]:
     """
-    Reads the embedded version hash from a GeoTIFF's metadata.
+    Reads the embedded version hash from a TIFF's metadata.
 
     Args:
-        filepath: The path to the GeoTIFF file to inspect.
+        filepath: The path to the TIFF file to inspect.
 
     Returns:
         The version string if found, otherwise None.
     """
+    # Simple check for TIF extension
+    if not filepath.lower().endswith(('.tif', '.tiff')):
+        return None
+
     try:
         result = subprocess.run(
             ["gdalinfo", "-json", filepath], capture_output=True, text=True, check=True
         )
         info = json.loads(result.stdout)
         # The metadata is nested under a blank key in the 'metadata' dict
-        return info.get("metadata", {}).get("", {}).get("LITEBUILD_VERSION")
+        # Note: Changed key to 'VERSION' to match the setter function
+        return info.get("metadata", {}).get("", {}).get("VERSION")
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
