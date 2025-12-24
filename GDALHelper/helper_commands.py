@@ -475,7 +475,6 @@ class HillshadeBlend(Command):
             print(f"❌ Hillshade Blend Failed: {e}")
             Path(self.args.output).unlink(missing_ok=True)
             raise
-
 @register_command("vignette")
 class Vignette(IOCommand):
     """
@@ -487,6 +486,7 @@ class Vignette(IOCommand):
           Controls the width of the fade gradient.
           Calculated as a % of the image's smallest dimension (Height or Width).
           Example: 5.0 creates a fade that covers 5% of the image.
+          **If 0, the input file is simply copied to the output.**
 
       --noise (float):
           Adds high-frequency "grain" (dithering) to the fade.
@@ -549,9 +549,16 @@ class Vignette(IOCommand):
         import rasterio
         import numpy as np
         from scipy.ndimage import distance_transform_edt
+        import shutil
 
         input_path = self.args.input
         output_path = self.args.output
+
+        # === 0. Bypass Check ===
+        if self.args.border <= 0:
+            self.print_verbose(f"--- Border is 0%. Copying '{input_path}' to '{output_path}' ---")
+            shutil.copy(input_path, output_path)
+            return
 
         # 1. Open Input to get Dimensions
         with rasterio.open(input_path) as src:
@@ -628,6 +635,7 @@ class Vignette(IOCommand):
             dst.write(output_data)
 
         self.print_verbose(f"✅ Created {output_path}")
+
 
 @register_command("create_mbtiles")
 class CreateMBTiles(IOCommand):
