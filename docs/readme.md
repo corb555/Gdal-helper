@@ -1,26 +1,20 @@
 
 # GDALHelper
 
-`gdal-helper` is a command-line tool that simplifies geospatial raster processing workflows.
-It acts as a high-level wrapper around **GDAL**, **Rasterio**, and **NumPy**, abstracting away the
-complexity of raw GDAL CLI arguments and enabling complex pixel manipulation (such as
-texture shading and vignette generation) within a script or build pipeline.
+`gdal-helper` is a Python command-line tool that simplifies complex geospatial raster workflows. It wraps **GDAL**, **Rasterio**, and **NumPy** 
+into high-level, semantic commands, automating tasks like texture shading, alignment, and vignette generation that usually require brittle shell scripts.
 
-This tool is designed for GIS professionals and data scientists who use raster data  and need a reliable, 
-scriptable way to simplify complex tasks.
+Designed for GIS professionals and data scientists who need a reliable, scriptable way to manage raster pipelines.
 
-##  Key Benefits
+## Key Benefits
 
-*   **Pipeline / Script Ready:** Designed to be used with scripts or build systems (e.g.,
-    Makefiles, LiteBuild).
-*   **Abstraction:** Replaces complex `gdalwarp`/`gdal_calc.py` chains with semantic commands like
-    `align_raster` or `hillshade_blend`.
-*   **Pixel-Level Control:** Uses NumPy/SciPy for operations that are difficult in standard GDAL,
-    such as distance-based vignetting and texture-shaded blending.
-*   **Safety:** Includes a validation step (`validate_raster`) to fail builds fast if artifacts
-    are empty or corrupt.
-*   **Extensible:** Uses a strict **Command Pattern** with auto-registration. Adding a new tool is
-    as simple as adding a class and a decorator.
+*   **Abstraction:** Replaces complex `gdalwarp`/`gdal_calc.py` chains with readable actions like `align_raster` or `hillshade_blend`.
+*   **Pixel-Level Control:** Leverages NumPy/SciPy for advanced operations difficult to do in standard GDAL, such as distance-based vignetting and 
+texture-shaded blending.
+*   **Extensible:** Built on a strict **Command Pattern**. Adding a new tool is as simple as defining a Python class with a decorator.
+
+## Installation
+`pip install GDALHelper`
 
 ##  Requirements
 
