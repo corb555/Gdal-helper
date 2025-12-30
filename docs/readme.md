@@ -50,15 +50,15 @@ scriptable way to simplify complex tasks.
 
 ##  Usage
 
-The utilities are accessed via the main entry point `gdal_helper.py`. All commands support a
+The utilities are accessed via the main entry point `gdal-helper`. All commands support a
 `-v/--verbose` flag for detailed logging.
 
 ```bash
 # General Syntax
-python -m GDALHelper.gdal_helper <command> [inputs] [options]
+gdal-helper <command> [inputs] [options]
 
 # Example
-python -m GDALHelper.gdal_helper align_raster input.tif template.tif output.tif
+gdal-helper align_raster input.tif template.tif output.tif
 ```
 
 ---
@@ -68,7 +68,7 @@ python -m GDALHelper.gdal_helper align_raster input.tif template.tif output.tif
 ### 1. Raster Manipulation
 
 #### `align_raster`
-Resamples and reprojects a source raster to perfectly match the grid, extent, and resolution of a
+Resamples a source raster to  match the grid, extent, and resolution of a
 template raster. Essential for ensuring pixel alignment before blending layers.
 
 ```bash
@@ -78,14 +78,13 @@ gdal-helper align_raster <source> <template> <output> \
 ```
 
 #### `create_subset`
-Extracts a cropped preview or subset from a larger raster based on relative anchor points.
+Extracts a cropped subset from a raster. Position of crop is based on relative anchor points.
 
 **Anchors:**
-Anchors define the center point of the crop relative to the image size (0.0 to 1.0).
+Anchors define the center point of the crop relative to the image (0.0 to 1.0).
 *   `0.0, 0.0`: Extract Top-Left corner.
 *   `0.5, 0.5`: Extract Center of the image (Default).
 *   `1.0, 1.0`: Extract Bottom-Right corner.
-
 
 ```bash
 gdal-helper create_subset input.tif output.tif \
@@ -96,17 +95,16 @@ gdal-helper create_subset input.tif output.tif \
 
 #### `apply_vignette`
 Adds an Alpha gradient to the edge of a raster, creating a vignette fade. This is used so that an
-overlayed raster blends seamlessly into the layer under it.
+overlayed raster blends seamlessly into the layer under it without a visible edge.
 
 **Parameters:**
 *   `--border` (float): Controls the width of the fade gradient. Calculated as a % of the image's
     smallest dimension (Height or Width). Example: 5.0 creates an alpha fade that covers 5% of the image.
-*   `--noise` (float): Adds high-frequency dithering to the fade. Calculated as a % of
+*   `--noise` (float): Adds  dithering to the fade. Calculated as a % of
     the 'border' size. This hides digital banding and makes the gradient look smoother.
-*   `--warp` (float): Adds low-frequency fractal distortion to the edge shape.
-    Calculated as a % of the 'border' size. This breaks up straight edge lines, making the edge look
-    organic. *Note: The visible image area shrinks slightly as warp increases to ensure edges
-    remain soft.*
+*   `--warp` (float): Adds fractal distortion to the edge shape.
+    Calculated as a % of the 'border' size. This breaks up straight edges, making the edge look
+    organic. 
 
 ```bash
 gdal-helper apply_vignette input.tif output.tif --border 10 --warp 60 --noise 20
@@ -134,12 +132,12 @@ Composites two layers (Layer A and Layer B) using a third layer as a blending ma
 *   **Layer A / Layer B:** RGB (3-band) or RGBA (4-band).
 *   **Mask:** Must be a **Single-Band Grayscale** image.
 
-**Mask Logic:**
+**Mask:**
 *   **White (255):** Shows 100% Layer A.
 *   **Gray Values:** Produces a weighted blend (e.g., 128 results in 50% A / 50% B).
 *   **Black (0):** Shows 100% Layer B.
 
-*Note: All three inputs must have identical dimensions and projections. Use `align_raster` first if
+*Note: All three inputs must have identical dimensions and projections. Use `align_raster`  if
 they do not match.*
 
 ```bash
@@ -147,10 +145,10 @@ gdal-helper masked_blend layerA.tif layerB.tif mask.tif output.tif
 ```
 
 #### `adjust_color_file`
-Programmatically updates the color definitions in a gdaldem color-relief text file (e.g., changing
-saturation, shifting hues, or adjusting brightness). This allows you to have a master gdaldem
-color-relief file and create variants that will still match the overall elevation and coloration of
-the original. It updates the text definition file, not the raster.
+Programmatically updates the color definitions in a gdaldem color-relief text file changing
+saturation,  hues, or  brightness. This allows you to have one master gdaldem
+color-relief file and create variants that match the overall elevation and coloration of
+the original. It updates the gdaldem definition file, not the raster's colors.
 
 [See detailed explanation at end.](#adjust_color_file-details)
 
@@ -162,8 +160,7 @@ gdal-helper adjust_color_file input_colors.txt output_colors.txt \
 ### 3. Output Formats
 
 #### `create_mbtiles`
-Converts a GeoTIFF to an MBTiles archive and generates internal overview pyramids (`gdaladdo`).
-Supports both PNG and JPEG formats.
+Converts a GeoTIFF to an MBTiles file and generates internal overview pyramids (`gdaladdo`).
 
 ```bash
 gdal-helper create_mbtiles input.tif output.mbtiles \
@@ -171,7 +168,7 @@ gdal-helper create_mbtiles input.tif output.mbtiles \
 ```
 
 #### `create_pmtiles`
-Converts an MBTiles archive into a cloud-native PMTiles archive. Requires the `pmtiles` executable
+Converts an MBTiles file into a  PMTiles file. Requires the `pmtiles` executable
 in the system PATH.
 
 ```bash
@@ -189,8 +186,8 @@ gdal-helper validate_raster input.tif --min-bytes 5000 --min-pixels 500
 ```
 
 #### `add_version` / `get_version`
-Embeds the current **Git Commit Hash** of the working directory into  GeoTIFF metadata tags, or retrieves it. This ensures 
-data provenance, allowing you to trace exactly which version of the configuration generated a specific map TIFF.
+Embeds the current **Git Commit Hash** of the working directory into GeoTIFF metadata tags, or retrieves it. This ensures 
+data provenance, allowing you to trace exactly which version of the configuration generated a specific  TIFF.
 
 *   If the repository has uncommitted changes, a **`-dirty`** suffix is appended to the hash.
 *   **Requirements:** Git must be installed, and the command must be run from within a versioned git repository.
@@ -211,25 +208,73 @@ gdal-helper publish build/map.tif /var/www/maps/ --stamp-version
 
 ---
 
+
 ## Extending GDALHelper
 
-GDALHelper is built on a **Command Pattern**. To add a new tool, define a class that inherits from
-`Command` or `IOCommand` and register it with the decorator.
+GDALHelper is built on a **Command Pattern**. To add a new tool, define a class that inherits from `Command` or `IOCommand` and register it with 
+the decorator in `helper_commands.py`.
 
-**Example:**
+### Choosing a Base Class
+*   **`IOCommand` (Recommended):** Use this if your tool takes one input file, processes it, and produces one output file. It automatically handles 
+the boilerplate for `input`, `output`, and validation.
+*   **`Command`:** Use this for complex tools with multiple inputs (like blending) or no outputs (like inspecting metadata).
+
+### How to Implement
+Your class needs to implement two key methods:
+
+1.  **`add_arguments(parser)`**:
+    *   This is where you define your custom CLI flags (e.g., `--size`, `--opacity`).
+    *   **Crucial:** If using `IOCommand`, call `super().add_arguments(parser)` first. This automatically adds the standard positional `input` and `output` 
+    arguments so you don't have to.
+
+2.  **`run_transformation()`**:
+    *   This is where your logic lives.
+    *   You have access to all command line arguments via `self.args` (e.g., `self.args.input`, `self.args.size`).
+    *   Use `self._run_command(["cmd", "arg"])` to execute shell commands safely with logging.
+    *   Use `self.print_verbose()` for logging info that should only appear in verbose mode.
+
+**Example Implementation:**
 
 ```python
-from GDALHelper.gdal_helper import IOCommand, register_command
+@register_command("create_subset")
+class CreateSubset(IOCommand):
+    """Extracts a smaller section from a large raster file."""
 
-@register_command("my_new_tool")
-class MyNewTool(IOCommand):
-    """Description of what the tool does."""
-    
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser):
+        # 1. Register the standard 'input' and 'output' args from the parent
+        super(CreateSubset, CreateSubset).add_arguments(parser)
+
+        # 2. Add your custom flags
+        parser.add_argument(
+            "--size", type=int, default=4000, help="The width/height of the crop."
+        )
+        parser.add_argument(
+            "--x-anchor", type=float, default=0.5,
+            help="Horizontal center (0.0=left, 0.5=center, 1.0=right)."
+        )
+
     def run_transformation(self):
-        # self.args.input and self.args.output are auto-populated
-        print(f"Processing {self.args.input}...")
-```
+        # The parent IOCommand has already verified that self.args.input exists.
+        
+        width, height = _get_image_dimensions(self.args.input)
 
+        # Calculate crop geometry
+        x_offset = int((width - self.args.size) * self.args.x_anchor)
+        y_offset = int((height - self.args.size) * self.args.y_anchor)
+        
+        # Build the gdal_translate command
+        command = [
+            "gdal_translate", 
+            "-srcwin", str(x_offset), str(y_offset), str(self.args.size), str(self.args.size),
+            self.args.input, 
+            self.args.output
+        ]
+        
+        # Execute
+        self._run_command(command)
+        self.print_verbose(f"✅ Subset created: {self.args.output}")
+```
 ---
 
 ## `adjust_color_file` Details
@@ -255,8 +300,8 @@ high-quality **base ramp** and then programmatically generate all other variatio
     blacks) from being artificially colorized.
 
 > **Note:** This command operates on the color definition text file itself, *before* it is used by
-> `gdaldem color-relief`. It does not modify raster images directly. It only works with numerical
-> RGB(A) color definitions, not named colors.
+> `gdaldem color-relief`. It does not modify raster images directly. 
+> It only works with numerical RGB(A) color definitions, not named colors.
 
 #### How the Adjustments Work
 
@@ -269,10 +314,10 @@ Saturation is the intensity of color.
 *   A value of `1.5` makes all colors 50% more vibrant.
 *   A value of `0.25` makes all colors 25% as vibrant (e.g. more gray).
 
-**Adjust Value (Brightness & Contrast)**
-Value is the brightness of a color, ranging from darkest (0) to brightest (1.0). Instead of a
+**Adjust Value (Brightness)**
+Value is the brightness, ranging from darkest (0) to brightest (1.0). Instead of a
 single brightness control, you have independent control over 3 different tonal regions. These all
-work by adding the specified value.
+work by **adding** the specified value.
 
 *   `--shadow-adjust`: Adds to the brightness of the darkest colors. Use a positive value (e.g.,
     `0.1`) to brighten shadows, or a negative value to further darken them.
@@ -299,7 +344,7 @@ green, 240° is blue).
     *   *Example:* `--min-hue 280 --max-hue 80` selects violets, magentas, reds, oranges, and
         yellows, leaving greens and blues untouched.
 
-**Elevation**
+**Adjust Elevation**
 *   The `--elev_adjust` argument acts as a simple multiplier on all elevation values in the file. A
     value of `1.1` would scale all elevations up by 10%.
 
@@ -318,11 +363,11 @@ gdal-helper adjust_color_file base_ramp.txt arid_ramp.txt --target-hue 46 --satu
 |:---------------------|:-------|:---------|:-------------------------------------------------------------|
 | `input`              | str    | -        | The source GDAL color definition file.                       |
 | `output`             | str    | -        | The path for the new, adjusted color file.                   |
-| `--saturation`       | float  | `1.0`    | Multiplies the saturation. `1.1` is a 10% increase.          |
-| `--shadow-adjust`    | float  | `0.0`    | Additively adjusts the brightness of dark colors.            |
-| `--mid-adjust`       | float  | `0.0`    | Additively adjusts the brightness of mid-range colors.       |
-| `--highlight-adjust` | float  | `0.0`    | Additively adjusts the brightness of light colors.           |
+| `--saturation`       | float  | `1.0`    | _Multiplies_ the saturation. `1.1` is a 10% increase.        |
+| `--shadow-adjust`    | float  | `0.0`    | _Additively_ adjusts the brightness of dark colors.          |
+| `--mid-adjust`       | float  | `0.0`    | _Additively_ adjusts the brightness of mid-range colors.     |
+| `--highlight-adjust` | float  | `0.0`    | _Additively_ adjusts the brightness of light colors.         |
 | `--min-hue`          | float  | `0.0`    | Lower bound of the hue range to adjust (0-360).              |
 | `--max-hue`          | float  | `0.0`    | Upper bound of the hue range to adjust (0-360).              |
 | `--target-hue`       | float  | `0.0`    | Target hue that colors in the range will be shifted towards. |
-| `--elev_adjust`      | float  | `1.0`    | Multiplies all elevation values. `1.1` is a 10% increase.    |
+| `--elev_adjust`      | float  | `1.0`    | _Multiplies_ all elevation values. `1.1` is a 10% increase.  |
