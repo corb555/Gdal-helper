@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "GDALHelper"
-version = "1.2.2"
+version = "1.2.5"
 description = "A collection of helper utilities for GDAL"
 authors = [{ name = "corb" }]
 readme = { file = "docs/readme.md", content-type = "text/markdown" }
@@ -35,4 +35,4 @@ gdal-helper = "GDALHelper.gdal_helper:main"
 "" = "."
 
 [project.urls]
-Repository = "https://github.com/corb555/GDALHelper"
+Repository = "https://github.com/corb555/Gdal-helper"

@@ -1,31 +1,21 @@
 
 # GDALHelper
 
-`gdal-helper` is a Python command-line tool that simplifies complex geospatial raster workflows. It wraps **GDAL**, **Rasterio**, and **NumPy** 
-into high-level, semantic commands, automating tasks like texture shading, alignment, and vignette generation that usually require brittle shell scripts.
+`gdal-helper` is a Python command-line tool that simplifies complex geospatial raster workflows. It wraps **GDAL**,
+**Rasterio**, and **NumPy** 
+with high-level commands, simplifying tasks like texture shading, alignment, and vignette generation 
+that usually require brittle shell scripts.
 
 Designed for GIS professionals and data scientists who need a reliable, scriptable way to manage raster pipelines.
 
 ## Key Benefits
 
-*   **Abstraction:** Replaces complex `gdalwarp`/`gdal_calc.py` chains with readable actions like `align_raster` or `hillshade_blend`.
+*   **Simplify:** Replaces complex `gdalwarp`/`gdal_calc.py` chains with readable actions like `align_raster` or `hillshade_blend`.
 *   **Pixel-Level Control:** Leverages NumPy/SciPy for advanced operations difficult to do in standard GDAL, such as distance-based vignetting and 
 texture-shaded blending.
 *   **Extensible:** Built on a strict **Command Pattern**. Adding a new tool is as simple as defining a Python class with a decorator.
 
-## Installation
-`pip install GDALHelper`
-
-##  Requirements
-
-*   Python 3.10+
-*   GDAL (System binaries and Python bindings)
-*   `rasterio`
-*   `numpy`
-*   `scipy`
-*   `pmtiles` (CLI executable for PMTiles conversion)
-
-##  Command Table of Contents
+##  Commands 
 
 1.  **Raster Manipulation**
     *   [`align_raster`](#align_raster) - Modify the grids and resolution of a Tiff to match another Tiff
@@ -44,11 +34,7 @@ texture-shaded blending.
 
 ##  Usage
 
-The utilities are accessed via the main entry point `gdal-helper`. All commands support a
-`-v/--verbose` flag for detailed logging.
-
 ```bash
-# General Syntax
 gdal-helper <command> [inputs] [options]
 
 # Example
@@ -365,3 +351,15 @@ gdal-helper adjust_color_file base_ramp.txt arid_ramp.txt --target-hue 46 --satu
 | `--max-hue`          | float  | `0.0`    | Upper bound of the hue range to adjust (0-360).              |
 | `--target-hue`       | float  | `0.0`    | Target hue that colors in the range will be shifted towards. |
 | `--elev_adjust`      | float  | `1.0`    | _Multiplies_ all elevation values. `1.1` is a 10% increase.  |
+
+## Installation
+`pip install GDALHelper`
+
+##  Requirements
+
+*   Python 3.10+
+*   GDAL (System binaries and Python bindings)
+*   `rasterio`
+*   `numpy`
+*   `scipy`
+*   `pmtiles` (CLI executable for PMTiles conversion)

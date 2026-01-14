@@ -318,7 +318,7 @@ class MaskedBlend(Command):
         import numpy as np
 
         self.print_verbose(
-            f"--- Blending '{self.args.layerA}' and '{self.args.layerB}' (Native Python) ---"
+            f"--- Blending A: '{self.args.layerA}'  B: '{self.args.layerB}' Mask: {self.args.mask} ---"
         )
         try:
             with rasterio.open(self.args.layerA) as src_a, \
@@ -580,9 +580,9 @@ class Vignette(IOCommand):
         warp_amt = int(fade_pixels * (self.args.warp / 100.0))
 
         self.print_verbose(
-            f"--- Vignette: {self.args.border}% ({fade_pixels}px) | "
-            f"Warp: {self.args.warp}% ({warp_amt}px) | "
-            f"Noise: {self.args.noise}% ({noise_amt}px) ---"
+            f"Border: {self.args.border}% ({fade_pixels}px) , "
+            f"Warp: {self.args.warp}% ({warp_amt}px) , "
+            f"Noise: {self.args.noise}% ({noise_amt}px)"
         )
 
         # 3. Smart Mask Generation
