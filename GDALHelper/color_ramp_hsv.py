@@ -1,25 +1,31 @@
 import colorsys
 import math
+import os
 from pathlib import Path
 import re
-from typing import List, Tuple, Any
+from typing import List, Tuple, Any, Final
+
+import yaml
 
 
-def adjust_color_ramp(
-        input_path: str, output_path: str, saturation_multiplier: float,
-        shadow_adjust: float, mid_adjust: float, highlight_adjust: float,
-        min_hue: float, max_hue: float, target_hue: float, elev_adjust: float
-) -> None:
+def new_color_ramp(
+        color_ramp_file: str, output_path: str, saturation_multiplier: float, shadow_adjust: float,
+        mid_adjust: float, highlight_adjust: float, min_hue: float, max_hue: float,
+        target_hue: float, elev_adjust: float
+) -> List:
     """
-    1) Reads a GDAL color ramp file
-    2) adjusts its colors in HSV space,
-    3) scales its elev values
-    4) writes a new file.
-
-    This function serves as a high-level orchestrator for the color and elev adjustment process.
+    Reads the color definitions from a color ramp file and updates
+    saturation,  hues, or  brightness and writes file (optional). This allows you to have one master
+    color-relief file and create variants that align with the overall elevation and coloration of
+    the original.
+    1) Reads a color ramp file (gdaldem color-relief format)
+    2) Adjusts its colors in HSV space using provided parameters
+    3) Scales its elev values
+    4) Writes a new file (Optional)
+    5) Returns the new color ramp table
 
     Args:
-        input_path: Path to the source GDAL color configuration file.
+        color_ramp_file: Path to the source GDAL color configuration file.
         output_path: Path where the adjusted configuration file will be saved.
         saturation_multiplier: Multiplies the saturation of each color.
             - 1.0 = no change.
@@ -34,26 +40,23 @@ def adjust_color_ramp(
             range will be shifted towards.
         elev_adjust: adjusts all the elev values by the scale provided.  1.0 is no change.
     """
-    # Phase 1: Read and parse the input file into a structured table.
-    color_table = read_color_file(input_path)
+    # Read and parse the GDAL color definition file into a structured table.
+    color_table = read_color_ramp(color_ramp_file)
 
-    # Phase 2: Apply the color transformations to the data.
-    adjusted_table = adjust_color_table_hsv(
-        color_table,
-        saturation_multiplier=saturation_multiplier,
-        shadow_adjust=shadow_adjust,
-        mid_adjust=mid_adjust,
-        highlight_adjust=highlight_adjust,
-        min_hue=min_hue,
-        max_hue=max_hue,
+    #  Apply HSV shifts to the color table.
+    adjusted_table = hsv_shift_colors(
+        color_table, saturation_multiplier=saturation_multiplier, shadow_adjust=shadow_adjust,
+        mid_adjust=mid_adjust, highlight_adjust=highlight_adjust, min_hue=min_hue, max_hue=max_hue,
         target_hue=target_hue
     )
 
-    # Phase 3: Apply the elevation scaling.
+    #  Apply the elevation scaling.
     adjusted_table = adjust_elevation(adjusted_table, elev_adjust)
 
-    # Phase 4: Format and write the adjusted table back to a file.
-    write_color_file(output_path, adjusted_table)
+    #  Format and write the adjusted table back to a color ramp file (optional)
+    if output_path:
+        write_color_file(output_path, adjusted_table)
+    return adjusted_table
 
 
 def adjust_elevation(color_table: list, elev_adjust: float) -> list:
@@ -96,7 +99,7 @@ def adjust_elevation(color_table: list, elev_adjust: float) -> list:
     return adjusted_table
 
 
-def adjust_color_table_hsv(
+def hsv_shift_colors(
         color_table: list, saturation_multiplier: float = 1.0, shadow_adjust: float = 0.0,
         mid_adjust: float = 0.0, highlight_adjust: float = 0.0, min_hue: float = 0.0,
         max_hue: float = 0.0, target_hue: float = 0.0
@@ -164,8 +167,8 @@ def adjust_color_table_hsv(
 
 def adjust_hsv(
         h: float, s: float, v: float, saturation_multiplier: float, shadow_adjust: float,
-        mid_adjust: float, highlight_adjust: float, min_hue: float,
-        max_hue: float, target_hue: float
+        mid_adjust: float, highlight_adjust: float, min_hue: float, max_hue: float,
+        target_hue: float
 ) -> tuple[float, float, float]:
     """Adjusts Hue, Saturation, and Value (HSV) for a single color with advanced controls.
 
@@ -210,73 +213,246 @@ def adjust_hsv(
     Returns:
         A tuple containing the new (h, s, v) values, each clamped between 0.0 and 1.0.
     """
-    # --- STAGE 1: Calculate Final Brightness (Value) ---
+    # --- Calculate Final Brightness (Value) ---
     # Create weights based on the original brightness (v). A color can be a mix
     # of shadow/mid or mid/highlight.
     shadow_weight = max(0, 1 - v * 2)
     highlight_weight = max(0, (v - 0.5) * 2)
-    mid_weight = 1 - shadow_weight - highlight_weight # Or 1 - abs((v-0.5)*2)
+    mid_weight = 1 - shadow_weight - highlight_weight  # Or 1 - abs((v-0.5)*2)
 
     total_adjustment = (
-            shadow_weight * shadow_adjust +
-            mid_weight * mid_adjust +
-            highlight_weight * highlight_adjust
-    )
+            shadow_weight * shadow_adjust + mid_weight * mid_adjust + highlight_weight *
+            highlight_adjust)
     final_v = max(0.0, min(1.0, v + total_adjustment))
 
-    # --- STAGE 2: Calculate Fade Factor to Protect Greys ---
+    # --- Calculate Fade Factor to Protect Greys ---
     # This factor approaches 0 for very dark, very bright, or desaturated colors.
     # It prevents the hue shift from "polluting" neutral tones with color.
     fade_factor = (1 - abs((v - 0.5) * 2)) * min(1.0, s * 4)
 
-    # --- STAGE 3: Calculate and Apply Hue Shift with Falloff ---
+    # ---  Calculate and Apply Hue Shift with Falloff ---
     final_h = h
     min_h_norm, max_h_norm, target_h_norm = min_hue / 360.0, max_hue / 360.0, target_hue / 360.0
 
     in_range = (min_h_norm <= h <= max_h_norm) if min_h_norm <= max_h_norm else (
-            h >= min_h_norm or h <= max_h_norm
-    )
+            h >= min_h_norm or h <= max_h_norm)
 
     if in_range and min_hue != max_hue:
         # --- Support SMOOTH FALLOFF ---
-        # 1. Calculate the center and width of the hue range, handling wrap-around.
+        #  Calculate the center and width of the hue range, handling wrap-around.
         if min_h_norm <= max_h_norm:
             range_width = max_h_norm - min_h_norm
             range_center = min_h_norm + (range_width / 2)
-        else: # Handle wrap-around case (e.g., 330 to 30 degrees)
+        else:  # Handle wrap-around case (e.g., 330 to 30 degrees)
             range_width = (1.0 - min_h_norm) + max_h_norm
             range_center = (min_h_norm + range_width / 2) % 1.0
 
-        # 2. Calculate the color's distance from the center of the range.
+        #  Calculate the color's distance from the center of the range.
         dist_from_center = abs(h - range_center)
         # Handle wrap-around distance
         if dist_from_center > 0.5:
             dist_from_center = 1.0 - dist_from_center
 
-        # 3. Create a weight that is 1.0 at the center and falls to 0.0 at the edges.
+        #  Create a weight that is 1.0 at the center and falls to 0.0 at the edges.
         #    We use a cosine curve for a very smooth, natural falloff.
         if range_width > 0:
             normalized_dist = dist_from_center / (range_width / 2)
             # The cosine function creates a perfect bell-curve like falloff.
             range_weight = math.cos(normalized_dist * (math.pi / 2))
-        else: # Avoid division by zero if range_width is 0
+        else:  # Avoid division by zero if range_width is 0
             range_weight = 1.0
 
         # Calculate the shortest distance around the color wheel.
         diff = target_h_norm - h
-        if diff > 0.5: diff -= 1.0
-        elif diff < -0.5: diff += 1.0
+        if diff > 0.5:
+            diff -= 1.0
+        elif diff < -0.5:
+            diff += 1.0
 
         # Apply the change, now moderated by BOTH the fade_factor and the new range_weight.
         hue_change = diff * fade_factor * range_weight
         final_h = (h + hue_change) % 1.0
 
-
-    # --- STAGE 4: Calculate and Apply Saturation Change ---
+    # --- Calculate and Apply Saturation Change ---
     final_s = s * saturation_multiplier
     final_s = max(0.0, min(1.0, final_s))
 
     return final_h, final_s, final_v
+
+
+def get_ramp_from_yml(
+        ramp_name: str, ramps_yml_settings: str, base_ramp: str, output_path: str
+):
+    """
+    Reads YAML file to get specs for the named ramp.  This supports 3 modes:
+    1. file - reads the filename configured
+    2. color - creates a ramp with the configured color
+    3. hsv - Generates a new color ramp by applying configured HSV shift factors
+
+    Sample YAML:
+    RAMPS:
+        humid_color_ramp:
+          mode: hsv
+          saturation: 1.0
+          shadow-adjust: 0
+          mid-adjust: 0
+          highlight-adjust: 0
+          min-hue: 0
+          max-hue: 0
+          target-hue: 0
+          elev-adjust: 1.0
+        snow_color_ramp:
+           mode: color
+           color: EF3E15
+        arid_color_ramp:
+          mode: file
+          file: arid_color.txt
+
+    Args:
+        ramp_name: The key in the YAML file to use (e.g. 'humid_color_ramp').
+        ramps_yml_settings: Path to the YAML file containing ramp  definitions.
+        base_ramp: Path to the master color text file to be adjusted.
+        output_path: Path where the new color file will be saved. No output if None.
+
+    Returns:
+        The color table filename for named ramp
+
+    Raises:
+        FileNotFoundError: If the YAML file or Base Input file does not exist.
+        ValueError: If the ramp_name is not found in the YAML.
+    """
+
+    # Validate Inputs
+
+    # Read in  settings from YML config file for this ramp name
+    mode, yml_config = read_yml_settings(ramps_yml_settings, ramp_name)
+    context = f"Get RAMPS YML entry: {ramp_name} Mode: {mode}\n"
+
+    # Call the HSV Adjuster
+    # Note: YAML keys use hyphens (mid-adjust), function args use underscores (mid_adjust)
+    if mode == "dynamic":
+        return mode, None
+    elif mode == "hsv":
+        print(f"HSV mode. {context}")
+        if not os.path.exists(base_ramp):
+            raise FileNotFoundError(f"Base color ramp file not found: {base_ramp}\n{context}")
+
+        new_color_ramp(
+            color_ramp_file=base_ramp, output_path=output_path,
+            saturation_multiplier=float(yml_config["saturation"]),
+            shadow_adjust=float(yml_config["shadow-adjust"]),
+            mid_adjust=float(yml_config["mid-adjust"]),
+            highlight_adjust=float(yml_config["highlight-adjust"]),
+            min_hue=float(yml_config["min-hue"]), max_hue=float(yml_config["max-hue"]),
+            target_hue=float(yml_config["target-hue"]), elev_adjust=float(yml_config["elev-adjust"])
+        )
+        return mode, output_path
+    elif mode == "color":
+        # get rgb_color and create file
+        create_rgb_ramp(output_path, yml_config["color"])
+        return mode, output_path
+    elif mode == "file":
+        # return filename
+        if "file" not in yml_config:
+            raise ValueError(
+                f"Yml config item {ramp_name} has mode 'file' but no file entry.\n{context}"
+            )
+
+        return mode, yml_config["file"]
+    else:
+        return None, None
+
+
+def read_yml_settings(ramps_config: str | Path, ramp_name: str) -> tuple[str, dict[str, Any]]:
+    """Read a ramp entry from a ramps YAML file and normalize it.
+
+    The YAML file is expected to contain a top-level mapping key ``RAMPS`` whose values
+    are per-ramp configuration mappings. Each ramp entry supports **one of these**
+    mutually exclusive modes:
+
+    1) **Solid-color definition** 
+       - Provide a non-empty ``color`` key (a 6-digit RGB hex string, optionally prefixed
+         with ``#``).
+       - In this mode, the configuration is returned **as-is** and no HSV defaults are
+         injected.
+
+    2) **HSV-shift definition** (used to derive a ramp from a base ramp)
+       - Omit ``color``
+       - In this mode, missing HSV-related fields are filled with defaults so downstream
+         code can rely on a complete set of keys.
+
+    3) **File Name** - Reads the specified Color Text File
+
+
+
+    Args:
+        ramps_config: Path to the ramps YAML configuration file.
+        ramp_name: Ramp key/name to read under the ``RAMPS`` root mapping.
+
+    Returns a tuple ``(mode, config)``:
+      - ``mode`` - hsv, color, file
+      - yml config dict
+
+    Raises:
+        FileNotFoundError: If ``ramps_hsv_settings`` does not exist.
+        ValueError: If the YAML cannot be parsed, if ``RAMPS`` is missing or not a
+            mapping, if ``ramp_name`` is not present, or if the ramp entry is not
+            a mapping.
+    """
+
+    if not os.path.exists(ramps_config):
+        raise FileNotFoundError(f"Ramp configuration file not found: {ramps_config}")
+
+    # Parse YAML
+    try:
+        with open(ramps_config, "r") as f:
+            all_ramps = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ValueError(f"Failed to parse ramp YAML file: {e}")
+
+    # Access the 'RAMPS' root key
+    config_root = (all_ramps or {}).get("RAMPS")
+    if not isinstance(config_root, dict):
+        raise ValueError(
+            f"Ramp YAML must contain a mapping at root key 'RAMPS'. Got: "
+            f"{type(config_root).__name__}"
+        )
+
+    if ramp_name not in config_root:
+        available = ", ".join(config_root.keys())
+        raise ValueError(
+            f"Ramp '{ramp_name}' not found in {ramps_config}.\n Available: {available}"
+        )
+
+    ramp_item = config_root[ramp_name] or {}
+    if not isinstance(ramp_item, dict):
+        raise ValueError(
+            f"Ramp '{ramp_name}' config must be a mapping, got: {type(ramp_item).__name__}"
+        )
+
+    # -------------------------
+    # Modes supported: 1) "hsv" HSV definitions, 2) "color" solid-color definition, 3) "file"
+    # ---------------------------
+    mode = ramp_item["mode"]
+
+    # Solid-color definition.  Return as-is
+    if mode == "color":
+        if ramp_item["color"] in (None, ""):
+            raise ValueError(f"⚠️  Invalid Color definition for {ramp_name}")
+        return mode, dict(ramp_item)
+    elif mode == "file":
+        return mode, dict(ramp_item)
+    elif mode == "dynamic":
+        return mode, None
+    elif mode == "hsv":
+        # HSV Definition - inject HSV defaults for any missing HSV fields.
+        hsv_defaults = {
+            "saturation": 1.0, "shadow-adjust": 0.0, "mid-adjust": 0.0, "highlight-adjust": 0.0,
+            "min-hue": 0.0, "max-hue": 0.0, "target-hue": 0.0, "elev-adjust": 1.0,
+        }
+        return mode, {**hsv_defaults, **ramp_item}
+    else:
+        raise ValueError(f"⚠️  Unknown ramp mode {mode}")
 
 
 def parse_gdal_line(line: str) -> tuple[bool, any]:
@@ -329,7 +505,7 @@ def parse_gdal_line(line: str) -> tuple[bool, any]:
     return True, (elevation, r, g, b, alpha)
 
 
-def read_color_file(input_path: str) -> List[Tuple[bool, Any]]:
+def read_color_ramp(input_path: str) -> List[Tuple[bool, Any]]:
     """
     Reads and parses a GDAL color ramp file into a structured list.
 
@@ -347,7 +523,7 @@ def read_color_file(input_path: str) -> List[Tuple[bool, Any]]:
     color_table = []
     input_file = Path(input_path)
     if not input_file.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
+        raise FileNotFoundError(f"Ramp file not found: {input_path}")
 
     with input_file.open("r", encoding="utf-8") as f:
         for line in f:
@@ -359,7 +535,7 @@ def read_color_file(input_path: str) -> List[Tuple[bool, Any]]:
     return color_table
 
 
-def write_color_file(output_path: str, color_table: List[Tuple[bool, Any]]) -> None:
+def write_color_file(output_path: str, color_table: List[Tuple[bool, Any]]) -> List:
     """
     Writes a structured color table to a GDAL color ramp file.
 
@@ -388,3 +564,67 @@ def write_color_file(output_path: str, color_table: List[Tuple[bool, Any]]) -> N
             f_out.write("\n".join(output_lines))
     except IOError as e:
         raise IOError(f"Failed to write to output file: {output_path}") from e
+    return output_lines
+
+
+_RGB_HEX_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-fA-F]{6}$")
+
+_RAMP_MIN_Z: Final[int] = -100
+_RAMP_MAX_Z: Final[int] = 10000
+_RAMP_ALPHA: Final[int] = 255
+
+
+def parse_rgb(hex_color: str):
+    """Parse an RGB hex color string into [R, G, B].
+
+    Args:
+        hex_color: RGB hex string like "EDEFF0" or "#EDEFF0".
+
+    Returns:
+        List of three ints [R, G, B], each in [0, 255].
+
+    Raises:
+        ValueError: If `hex_color` is not a valid 6-digit RGB hex string.
+    """
+    s = hex_color.strip()
+    if s.startswith("#"):
+        s = s[1:]
+
+    if not _RGB_HEX_RE.fullmatch(s):
+        raise ValueError(
+            "hex_color must be a 6-digit RGB hex string like 'EDEFF0' (optionally prefixed '#'); "
+            f"got: {hex_color!r}"
+        )
+
+    r = int(s[0:2], 16)
+    g = int(s[2:4], 16)
+    b = int(s[4:6], 16)
+    return r, g, b
+
+
+def create_rgb_ramp(filename: str | Path, hex_color: str) -> List:
+    """Create a constant-color GDAL color-relief ramp file from an RGB hex string.
+
+    The output ramp contains two stops with identical RGBA values:
+
+        -10000 R G B 255
+         10000 R G B 255
+
+    Args:
+        filename: Output ramp file path to write.
+        hex_color: RGB hex string like "EDEFF0" or "#EDEFF0".
+
+    Returns:
+        The written ramp file contents as a list.
+
+    Raises:
+        ValueError: If `hex_color` is invalid.
+        OSError: If the file cannot be written.
+    """
+    r, g, b = parse_rgb(hex_color)
+    out_path = Path(filename).expanduser().resolve()
+    output_lines = [f"{_RAMP_MIN_Z} {r} {g} {b} {_RAMP_ALPHA}\n",
+                    f"{_RAMP_MAX_Z} {r} {g} {b} {_RAMP_ALPHA}\n"]
+
+    out_path.write_text("\n".join(output_lines), encoding="utf-8")
+    return output_lines

@@ -2,30 +2,37 @@
 # GDALHelper
 
 `gdal-helper` is a Python command-line tool that simplifies complex geospatial raster workflows. It wraps **GDAL**,
-**Rasterio**, and **NumPy** 
-with high-level commands, simplifying tasks like texture shading, alignment, and vignette generation 
+**Rasterio**, and **NumPy**
+with high-level commands, simplifying tasks like texture shading, alignment, and vignette generation
 that usually require brittle shell scripts.
 
 Designed for GIS professionals and data scientists who need a reliable, scriptable way to manage raster pipelines.
 
+> NOTE: This is beta software
+> Breaking changes to parameters may be introduced in subsequent releases
+
 ## Key Benefits
 
 *   **Simplify:** Replaces complex `gdalwarp`/`gdal_calc.py` chains with readable actions like `align_raster` or `hillshade_blend`.
-*   **Pixel-Level Control:** Leverages NumPy/SciPy for advanced operations difficult to do in standard GDAL, such as distance-based vignetting and 
-texture-shaded blending.
+*   **Safety & Validation:** The `run` command wraps standard GDAL tools but validates your creation options (`-co`) against the driver specifications, preventing silent failures where GDAL ignores invalid flags.
+*   **Pixel-Level Control:** Leverages NumPy/SciPy for advanced operations difficult to do in standard GDAL, such as distance-based vignetting and
+    texture-shaded blending.
 *   **Extensible:** Built on a strict **Command Pattern**. Adding a new tool is as simple as defining a Python class with a decorator.
 
-##  Commands 
+##  Commands
 
 1.  **Raster Manipulation**
     *   [`align_raster`](#align_raster) - Modify the grids and resolution of a Tiff to match another Tiff
     *   [`create_subset`](#create_subset) - Extract a crop of an image.
     *   [`apply_vignette`](#apply_vignette) - Fade edges with organic noise.
 2.  **Blending & Visualization**
+    *   [`create_biome_layer`](#create_biome_layer) - Procedural terrain shader blending Arid, Humid, and Steep layers.
     *   [`hillshade_blend`](#hillshade_blend) - Intelligently blend a hillshade with a color relief
     *   [`masked_blend`](#masked_blend) - Composite layers using a mask.
     *   [`adjust_color_file`](#adjust_color_file) - Programmatically shift HSV values in a gdaldem color config file.
+    *   [`reclassify`](#reclassify) - Reclassifies a categorical raster into a compact 8-bit class raster.
 3.  **Validation and Publishing**
+    *   [`run`](#run) - Execute standard GDAL commands with strict option validation.
     *   [`create_mbtiles`](#create_mbtiles) - Generate MBTiles with pyramids from a Tiff
     *   [`create_pmtiles`](#create_pmtiles) - Convert an MBTile to PMTile.
     *   [`validate_raster`](#validate_raster) - Validate that a raster meets a minimum size
@@ -74,23 +81,71 @@ gdal-helper create_subset input.tif output.tif \
 ```
 
 #### `apply_vignette`
-Adds an Alpha gradient to the edge of a raster, creating a vignette fade. This is used so that an
-overlayed raster blends seamlessly into the layer under it without a visible edge.
+Adds an alpha gradient at the edge of a raster so overlays blend cleanly into the layer below.
 
 **Parameters:**
-*   `--border` (float): Controls the width of the fade gradient. Calculated as a % of the image's
-    smallest dimension (Height or Width). Example: 5.0 creates an alpha fade that covers 5% of the image.
-*   `--noise` (float): Adds  dithering to the fade. Calculated as a % of
-    the 'border' size. This hides digital banding and makes the gradient look smoother.
-*   `--warp` (float): Adds fractal distortion to the edge shape.
-    Calculated as a % of the 'border' size. This breaks up straight edges, making the edge look
-    organic. 
+*   `--border` (float): Width of the fade as a % of the smaller image dimension.
+    Example: 5.0 = fade covers ~5% of the image.
+*   `--noise` (float): Dither area as a % of border (reduces banding).
+*   `--warp` (float): Fractal distortion size as a % of border (breaks up straight edges).
 
 ```bash
 gdal-helper apply_vignette input.tif output.tif --border 10 --warp 60 --noise 20
 ```
 
 ### 2. Blending & Visualization
+
+#### `create_biome_layer`
+Similar to gdaldem color-relief, this creates a color-relief raster from a DEM, but produces a more 
+natural-looking terrain raster that responds to
+climate and geomorphology—e.g., deserts vs. forests vs. alpine rock.
+
+The color relief is created by blending three color palettes — Arid, Humid, and Steep — using precipitation data,
+slope, and topographic position (ridge vs gully).  The arid palette can also be a blend of arid and
+arid_red using a surface lithology GeoTiff.
+
+The blended palette is calculated per-pixel in a single pass,
+rather than generating multiple intermediate layers and blending them serially. This is faster and preserves
+clean, saturated colors.
+
+**What it does**
+
+1. **Base layer**: Computes the palette from the DEM using the Humid ramp and elevation (similar to gdaldem color-relief).
+
+2. **Precip blend** (optional): Blends the Arid Pallete and Humid Palette per pixel using a precipitation 
+GeoTIFF. `--no-precip` disables this step.
+
+3. **Micro-climate** (optional): Uses TPI (Topographic Position Index; ridge vs. gully) to bias ridges drier 
+and gullies wetter in the precipitation input to Precip Blend. `--no-tpi` disables this step.
+
+4. **Cliffs** (optional): Blends in the Steep (rock) palette per pixel based on slope. `--no-slope` disables this step.
+
+**Inputs:**
+DEM file -  elevation GeoTIFF
+Precipitation GeoTIFF - (optional) gridded annual precip in mm
+Slope GeoTIFF - (optional) e.g. output from gdaldem slope
+Color ramps (same format as gdaldem color-relief):
+   arid -  palette for dry areas
+   humid - palette for wet areas
+   steep - palette for cliffs/rock
+
+**Parameters:**
+**Precip Blend**
+--precip-min - values ≤ this are 100% Arid
+--precip-max - values ≥ this are 100% Humid
+Values between are blended smoothly.  
+
+**Cliffs**
+--slope-min 25 - values ≤ this are 0% Steep
+--slope-max 45 - values ≥ this are 100% Steep
+Values between are blended smoothly.
+
+```bash
+gdal-helper create_biome_layer build/Yosemite/Yosemite output.tif \
+  --precip-min 150 --precip-max 750 \
+  --slope-min 25 --slope-max 45
+```
+
 
 #### `hillshade_blend`
 Blends a grayscale hillshade onto a color relief map using **Texture Shading** logic.
@@ -123,6 +178,87 @@ they do not match.*
 ```bash
 gdal-helper masked_blend layerA.tif layerB.tif mask.tif output.tif 
 ```
+
+#### `reclassify`
+
+Reclassifies a categorical raster into a compact 8-bit class raster, with an optional sidecar alpha mask for downstream
+blending/feathering.  Takes a list of categories, filters the raster to those and outputs them as 8-bit values. 
+
+This is ideal for large classification layers (e.g., LandFire EVT/FBFM) when you only need a small subset of categories
+and want faster rendering using a much smaller and simpler output.
+
+> The output can only support 255 categories
+
+**Inputs:**
+
+* **Source Raster:** A **Single-Band Categorical** raster with integer classes, e.g. EVT.
+* **Config (`--config`):** YAML file defining categories and output values and optional palette/alpha behavior.
+
+**Outputs:**
+
+* **Class Raster (`output.tif`):** A **Single-Band `byte`** raster where each pixel is replaced with a derived class value.
+
+    * **Default Value:** Pixels that match no rule are set to `options default_value` (usually `0`).
+    * **Priority:** Rules are applied **in config order**; the first matching rule wins.
+    * **Palette (Optional):** If any class defines `rgb`, an embedded GeoTIFF palette is written so utilities
+      like QGIS can render it as a color palette layer.
+* **Alpha Raster (Optional):** A **Single-Band `byte`** raster written as a *sidecar file*.
+
+    * **255:** Pixel matched any rule (presence).
+    * **0:** Pixel matched no rule (absence).
+    * Use `gdal-helper blur` to soften edges for cartographic blending.
+
+**Config (`--config`) File:**
+
+* **`classes[]`**: Each rule defines `name`, `ids`, optional `value`, and optional `rgb`.
+* **`options.default_value`**: Output value for unmatched pixels.
+* **`options.alpha.enabled`**: Enable/disable alpha output and set its path/values.
+* **`options.report_unmapped`**: Optionally report source IDs encountered that were not mapped.
+
+Sample:
+```yaml
+config_type: "Reclassify"
+classes:
+  - name: dark_rock   # Only used as a comment
+    rgb: "4d4339"     # Optional - Used to fill in color palette for this item
+    ids: [9033, 9153, 7734]   # The ID or ID's that will map to this value
+    # value: omitted -> value defaults to 1, (config index)
+  - name: playa
+    rgb: "e3dbca"
+    ids: [9008]
+    # value: omitted -> value defaults to 2, (config index)
+  - name: water
+    rgb: "7d95ab"
+    ids: [7735]
+    value: 10   # Optional - explicit value for this category
+
+options:
+  default_value: 0   # Value for unmatched items. Default=0
+  nodata_value: 0    # nodata value. Default=0
+  tile_size: 256     # tile size. Default=255
+  compress: deflate  # compression. Default=deflate
+
+  alpha:
+    enabled: true  # Optional - create alpha sidecar.  Default=true
+    #  Optional - Default: name derived from main output as "<stem>_alpha.tif"
+    output: "{BUILD_DIR}/{profile_name}_EVT_subset_alpha.tif"
+    on: 255  # Value for any category match.  Default=255
+    off: 0   # Value for no category.  Default=0
+
+  report_unmapped:
+    enabled: true
+    max_ids: 50
+
+
+```
+
+*Note: Reclassify does not resample or align rasters. If your downstream layers must match dimensions/projection, run
+`align_raster` (or your equivalent step) first.*
+
+```bash
+gdal-helper reclassify --config reclassify.yml LF2024_EVT.tif EVT_subset.tif
+```
+
 
 #### `adjust_color_file`
 Programmatically updates the color definitions in a gdaldem color-relief text file changing
@@ -157,6 +293,16 @@ gdal-helper create_pmtiles input.mbtiles output.pmtiles
 
 ### 4. Validation and Publishing
 
+#### `run`
+A passthrough command that executes standard GDAL tools (like `gdal_translate` or `gdalwarp`) but adds **Creation Option Validation**.
+
+Standard GDAL tools will often silently ignore invalid `-co` flags (e.g., typos like `COMPRESS=BAD_ALGO` or unsupported options like `WEBP_QUALITY` on a GTiff driver). This wrapper queries the driver capabilities first and throws a hard error if you try to use an invalid option.
+
+```bash
+# This will fail immediately with a clear error because 'FAKE' is not a valid compression
+gdal-helper run gdal_translate -of GTiff -co COMPRESS=FAKE input.tif output.tif
+```
+
 #### `validate_raster`
 Asserts that a raster exists and meets minimum size requirements. Useful for stopping a build
 pipeline if an upstream process produced a 1x1 pixel empty file (a common GDAL failure mode).
@@ -166,7 +312,7 @@ gdal-helper validate_raster input.tif --min-bytes 5000 --min-pixels 500
 ```
 
 #### `add_version` / `get_version`
-Embeds the current **Git Commit Hash** of the working directory into GeoTIFF metadata tags, or retrieves it. This ensures 
+Embeds the current **Git Commit Hash** of the working directory into GeoTIFF metadata tags, or retrieves it. This ensures
 data provenance, allowing you to trace exactly which version of the configuration generated a specific  TIFF.
 
 *   If the repository has uncommitted changes, a **`-dirty`** suffix is appended to the hash.
@@ -191,12 +337,12 @@ gdal-helper publish build/map.tif /var/www/maps/ --stamp-version
 
 ## Extending GDALHelper
 
-GDALHelper is built on a **Command Pattern**. To add a new tool, define a class that inherits from `Command` or `IOCommand` and register it with 
-the decorator in `helper_commands.py`.
+GDALHelper is built on a **Command Pattern**. To add a new tool, define a class that inherits from `Command` or `IOCommand` and register it with
+the decorator in `commands.py`.
 
 ### Choosing a Base Class
-*   **`IOCommand` (Recommended):** Use this if your tool takes one input file, processes it, and produces one output file. It automatically handles 
-the boilerplate for `input`, `output`, and validation.
+*   **`IOCommand` (Recommended):** Use this if your tool takes one input file, processes it, and produces one output file. It automatically handles
+    the boilerplate for `input`, `output`, and validation.
 *   **`Command`:** Use this for complex tools with multiple inputs (like blending) or no outputs (like inspecting metadata).
 
 ### How to Implement
@@ -204,8 +350,8 @@ Your class needs to implement two key methods:
 
 1.  **`add_arguments(parser)`**:
     *   This is where you define your custom CLI flags (e.g., `--size`, `--opacity`).
-    *   **Crucial:** If using `IOCommand`, call `super().add_arguments(parser)` first. This automatically adds the standard positional `input` and `output` 
-    arguments so you don't have to.
+    *   **Crucial:** If using `IOCommand`, call `super().add_arguments(parser)` first. This automatically adds the standard positional `input` and `output`
+        arguments so you don't have to.
 
 2.  **`run_transformation()`**:
     *   This is where your logic lives.
@@ -280,7 +426,7 @@ high-quality **base ramp** and then programmatically generate all other variatio
     blacks) from being artificially colorized.
 
 > **Note:** This command operates on the color definition text file itself, *before* it is used by
-> `gdaldem color-relief`. It does not modify raster images directly. 
+> `gdaldem color-relief`. It does not modify raster images directly.
 > It only works with numerical RGB(A) color definitions, not named colors.
 
 #### How the Adjustments Work
@@ -350,7 +496,7 @@ gdal-helper adjust_color_file base_ramp.txt arid_ramp.txt --target-hue 46 --satu
 | `--min-hue`          | float  | `0.0`    | Lower bound of the hue range to adjust (0-360).              |
 | `--max-hue`          | float  | `0.0`    | Upper bound of the hue range to adjust (0-360).              |
 | `--target-hue`       | float  | `0.0`    | Target hue that colors in the range will be shifted towards. |
-| `--elev_adjust`      | float  | `1.0`    | _Multiplies_ all elevation values. `1.1` is a 10% increase.  |
+| `--elev-adjust`      | float  | `1.0`    | _Multiplies_ all elevation values. `1.1` is a 10% increase.  |
 
 ## Installation
 `pip install GDALHelper`
@@ -362,4 +508,4 @@ gdal-helper adjust_color_file base_ramp.txt arid_ramp.txt --target-hue 46 --satu
 *   `rasterio`
 *   `numpy`
 *   `scipy`
-*   `pmtiles` (CLI executable for PMTiles conversion)
+*   `pmtiles` (CLI executable for PMTiles)
