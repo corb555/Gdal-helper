@@ -1,85 +1,560 @@
+
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 from pathlib import Path
-import subprocess
-from typing import Union, Optional
+from typing import List
 
-from GDALHelper.blur_raster import _compute_pad
+from GDALHelper.buffered_vector_mask import BufferedVectorMaskConfig, buffered_vector_mask_add_args, \
+    create_buffered_vector_mask
 from GDALHelper.color_ramp_hsv import new_color_ramp
-from GDALHelper.gdal_helper import Command, IOCommand, COMMAND_REGISTRY, register_command
+from GDALHelper.feather_raster import SIGMA_DEFAULT, feather
+from GDALHelper.inpaint_raster import inpaint_raster_add_args, InpaintRasterConfig, inpaint_raster
+from GDALHelper.overlay_layers import overlay_layers
+from GDALHelper.utils import Command, IOCommand, ConfigurationError, CommandError, FileError, \
+    _get_image_dimensions, _get_raster_info, GAUSSIAN_TRUNCATE_DEFAULT, generate_fractal_noise, \
+    BASE_SCALE_MIN_PIXELS, smoothstep01, ALPHA_MAX, MIN_FADE_PIXELS
 from GDALHelper.git_utils import get_git_hash, set_tiff_version, get_tiff_version
+from GDALHelper.lookup_raster import (COMPRESS_DEFAULT, DEFAULT_MAX_LOOKUP_KEY,
+                                      DEFAULT_MAX_UNMAPPED_IDS, TILE_SIZE_DEFAULT,
+                                      LookupRasterOptions, _parse_default_value,
+                                      _parse_input_nodata, lookup_raster, )
 from GDALHelper.manifest import generate_manifest
-from GDALHelper.reclassify import _parse_reclass_config, _validate_no_duplicate_ids, \
-    _derive_alpha_path, _build_palette, _reclassify_and_output, _load_yaml
+from GDALHelper.reclassify import (_parse_reclass_config, _derive_alpha_path,
+                                   _reclassify_and_output, _load_yaml)
+from GDALHelper.smooth_categories import smooth_categories_kernel
+from GDALHelper.tile_reader import run_tiled_kernel
+
 import numpy as np
 from tqdm import tqdm
 
 
-# Note: rasterio, and scipy are imported lazily inside specific commands
-# to avoid forcing users to install them if they only use the CLI wrappers.
-
 # ===================================================================
-# Utility Functions
+# Command Registry and argparse Subcommands
 # ===================================================================
 
-def _block_window_total(ds, band_index: int = 1) -> Optional[int]:
-    """Compute total number of block windows without materializing them."""
-    try:
-        bh, bw = ds.block_shapes[band_index - 1]  # (block_height, block_width)
-        return math.ceil(ds.height / bh) * math.ceil(ds.width / bw)
-    except Exception:
+CommandType = type[Command]
+REGISTERED_COMMANDS: dict[str, CommandType] = {}
+
+
+def register_command(name: str):
+    """Register a command class under one CLI subcommand name.
+
+    The registry keeps command declaration decoupled from CLI parser creation.
+    :func:`add_registered_subparsers` later uses this registry to build native
+    argparse subparsers, so each command receives its own help, validation, and
+    usage text.
+
+    Args:
+        name: User-facing subcommand name.
+
+    Returns:
+        Decorator that registers a :class:`Command` subclass.
+
+    Raises:
+        ValueError: If the command name is empty or already registered.
+        TypeError: If the decorated class is not a :class:`Command` subclass.
+    """
+    command_name = name.strip()
+    if not command_name:
+        raise ValueError("Command name cannot be empty.")
+
+    def decorator(cls: CommandType) -> CommandType:
+        if not issubclass(cls, Command):
+            raise TypeError(
+                f"Registered command '{command_name}' must inherit from Command."
+            )
+
+        if command_name in REGISTERED_COMMANDS:
+            existing = REGISTERED_COMMANDS[command_name]
+            raise ValueError(
+                f"Command '{command_name}' is already registered by "
+                f"{existing.__name__}."
+            )
+
+        REGISTERED_COMMANDS[command_name] = cls
+        return cls
+
+    return decorator
+
+
+def _command_summary(command_class: CommandType) -> str | None:
+    """Return the first non-empty docstring line for argparse command help."""
+    docstring = command_class.__doc__
+    if not docstring:
         return None
 
+    return next(
+        (line.strip() for line in docstring.splitlines() if line.strip()),
+        None,
+    )
 
-def _get_image_dimensions(filepath: str) -> tuple[int, int]:
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Cannot get dimensions: File not found at '{filepath}'")
-    try:
-        result = subprocess.run(
-            ["gdalinfo", "-json", filepath], capture_output=True, text=True, check=True
+
+def add_registered_subparsers(
+    parser: argparse.ArgumentParser,
+) -> argparse._SubParsersAction:
+    """Add all registered GDALHelper commands as argparse subparsers.
+
+    The command registry remains the source of truth for available commands,
+    while argparse owns command selection, command-specific help, argument
+    validation, and usage reporting.
+
+    Args:
+        parser: Top-level ``gdal-helper`` argument parser.
+
+    Returns:
+        The argparse subparser action created for the registered commands.
+    """
+    subparsers = parser.add_subparsers(
+        dest="command_name",
+        metavar="COMMAND",
+        required=True,
+    )
+
+    for name, command_class in sorted(
+        REGISTERED_COMMANDS.items(),
+        key=lambda item: item[0].casefold(),
+    ):
+        summary = _command_summary(command_class)
+        command_parser = subparsers.add_parser(
+            name,
+            help=summary,
+            description=summary,
         )
-        info = json.loads(result.stdout)
-        return info['size']
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to get dimensions for {filepath}. Is gdalinfo in your PATH? Error: {e}"
-        )
+        command_class.add_arguments(command_parser)
+        command_parser.set_defaults(command_class=command_class)
+
+    return subparsers
 
 
-def _get_raster_info(filepath: str) -> dict:
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Cannot get raster info: File not found at '{filepath}'")
-    try:
-        result = subprocess.run(
-            ["gdalinfo", "-json", filepath], capture_output=True, text=True, check=True
-        )
-        info = json.loads(result.stdout)
+def build_parser(
+    prog: str = "gdal-helper",
+    description: str = "Raster and GDAL workflow utilities.",
+) -> argparse.ArgumentParser:
+    """Build the top-level GDALHelper parser and all command subparsers.
 
-        resolution = (info['geoTransform'][1], info['geoTransform'][5])
-        srs_wkt = info['coordinateSystem']['wkt']
-        corners = info['cornerCoordinates']
-        xmin = min(c[0] for c in corners.values())
-        xmax = max(c[0] for c in corners.values())
-        ymin = min(c[1] for c in corners.values())
-        ymax = max(c[1] for c in corners.values())
+    Args:
+        prog: Program name shown in help and usage text.
+        description: Top-level CLI description.
 
-        return {
-            "resolution": resolution, "extent": (xmin, ymin, xmax, ymax), "srs_wkt": srs_wkt
-        }
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to get raster info for {filepath}. Is gdalinfo in your PATH? Error: {e}"
-        )
+    Returns:
+        Fully configured argument parser.
+    """
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description=description,
+    )
+    add_registered_subparsers(parser)
+    return parser
 
+
+# Note: import large packages like rasterio, scipy, etc. lazily inside specific commands
+# to avoid forcing users to install them if they only use other functions.
 
 # ================================
 # GDAL-Helper Commands
 #    IOCommand(Command): transform Input -> Output
 # ================================
+
+@register_command("create_dem")
+class CreateDEM(Command):
+    """Create one validated DEM from one or more source rasters."""
+
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
+        from GDALHelper.create_dem import create_dem_add_args
+
+        create_dem_add_args(parser)
+
+    def execute(self) -> None:
+        from GDALHelper.create_dem import CreateDEMConfig, create_dem
+
+        config = CreateDEMConfig(self.args)
+
+        try:
+            create_dem(config)
+        except FileExistsError as exc:
+            # Existing output is an expected user-facing file condition, not
+            # an unexpected programming error.
+            raise FileError(str(exc)) from exc
+
+        self.print_verbose(f"✅ Wrote validated DEM: {self.args.output}")
+        
+@register_command("broad_hillshade")
+class BroadHillshade(Command):
+    """Generate medium/broad terrain shading from a DEM.
+
+    This is the wide-shading companion to ``gdaldem hillshade -igor``. Igor owns
+    fine terrain detail; this command produces coherent medium/broad terrain
+    massing for later combination by LandWeaver's ``terrain_shading`` operation.
+
+    Output is a single-band uint8 attenuation raster where 255 is neutral / no
+    additional shadow and 0 is maximum shadow.
+    """
+
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("dem", help="Source DEM.")
+        parser.add_argument("output", help="Output uint8 broad hillshade raster.")
+
+        light_group = parser.add_argument_group("Light direction")
+        light_group.add_argument(
+            "--azimuth",
+            type=float,
+            default=315.0,
+            help="Light azimuth in degrees clockwise from north. Default: 315.",
+        )
+        light_group.add_argument(
+            "--altitude",
+            type=float,
+            default=35.0,
+            help="Light altitude in degrees above the horizon. Default: 35.",
+        )
+        light_group.add_argument(
+            "--gain",
+            type=float,
+            default=2.5,
+            help=(
+                "Fixed terrain exaggeration applied to both smoothed lighting scales. "
+                "Default: 2.5."
+            ),
+        )
+
+        scale_group = parser.add_argument_group("Wide relief scales")
+        scale_group.add_argument(
+            "--medium-sigma",
+            type=float,
+            default=5.0,
+            help="Gaussian sigma for medium-scale terrain form. Default: 5.",
+        )
+        scale_group.add_argument(
+            "--broad-sigma",
+            type=float,
+            default=28.0,
+            help="Gaussian sigma for broad-scale terrain form. Default: 28.",
+        )
+        scale_group.add_argument(
+            "--medium-weight",
+            type=float,
+            default=0.65,
+            help="Blend weight for medium-scale lighting. Default: 0.65.",
+        )
+        scale_group.add_argument(
+            "--broad-weight",
+            type=float,
+            default=0.35,
+            help="Blend weight for broad-scale lighting. Default: 0.35.",
+        )
+
+        processing_group = parser.add_argument_group("Processing")
+        processing_group.add_argument(
+            "--tile-size",
+            type=int,
+            default=2048,
+            help="Logical output tile size in pixels. Default: 2048.",
+        )
+
+    def execute(self) -> None:
+        # Lazy import keeps rasterio/scipy optional for commands that do not use them.
+        from GDALHelper.broad_hillshade import BroadHillshadeConfig, generate_broad_hillshade
+
+        config = BroadHillshadeConfig(
+            azimuth_deg=self.args.azimuth,
+            altitude_deg=self.args.altitude,
+            gain=self.args.gain,
+            medium_sigma_px=self.args.medium_sigma,
+            broad_sigma_px=self.args.broad_sigma,
+            medium_weight=self.args.medium_weight,
+            broad_weight=self.args.broad_weight,
+            tile_size_px=self.args.tile_size,
+        )
+
+        self.print_verbose(
+            f"--- Broad hillshade: azimuth={config.azimuth_deg:.2f}, "
+            f"altitude={config.altitude_deg:.2f}, gain={config.gain:.3f}, "
+            f"medium={config.medium_sigma_px:.2f}px/{config.medium_weight:.3f}, "
+            f"broad={config.broad_sigma_px:.2f}px/{config.broad_weight:.3f} ---"
+        )
+
+        generate_broad_hillshade(
+            Path(self.args.dem),
+            Path(self.args.output),
+            config,
+        )
+
+        self.print_verbose(f"✅ Wrote broad hillshade raster: {self.args.output}")
+
+
+@register_command("hillshade_blend")
+class HillshadeBlend(Command):
+    """Blend a grayscale hillshade onto a color relief using texture shading.
+
+    The blend is primarily multiplicative:
+
+        out = rgb * hill
+
+    Shadow and highlight protection can reduce shading near tonal extremes
+    to preserve color saturation and avoid harsh clipping.
+
+    Optional hillshade tone mapping can be applied before blending.
+    """
+
+    @staticmethod
+    def add_arguments(parser) -> None:
+        parser.add_argument("hillshade", help="Input hillshade")
+        parser.add_argument("color", help="Input color image (RGB or RGBA)")
+        parser.add_argument("output", help="Output path")
+
+        parser.add_argument(
+            "--co",
+            action="append",
+            help="Creation option, e.g. COMPRESS=DEFLATE",
+        )
+
+        parser.add_argument(
+            "--protect-shadows",
+            type=float,
+            default=0.2,
+            help=(
+                "Shadow protection strength in [0..1]. 0 disables. "
+                "Typical: 0.2–0.6."
+            ),
+        )
+        parser.add_argument(
+            "--protect-highlights",
+            type=float,
+            default=0.10,
+            help=(
+                "Highlight protection strength in [0..1]. 0 disables. "
+                "Typical: 0.05–0.25."
+            ),
+        )
+        parser.add_argument(
+            "--shadow-range",
+            type=int,
+            nargs=2,
+            metavar=("START", "END"),
+            default=[0, 60],
+            help=(
+                "Shadow protection ramp in byte space [0..255]. "
+                "Full protection near START, fading to none by END."
+            ),
+        )
+        parser.add_argument(
+            "--highlight-range",
+            type=int,
+            nargs=2,
+            metavar=("START", "END"),
+            default=[220, 255],
+            help=(
+                "Highlight protection ramp in byte space [0..255]. "
+                "No protection until START, reaching full protection by END."
+            ),
+        )
+
+        parser.add_argument(
+            "--hill-floor",
+            type=float,
+            default=0.0,
+            help=(
+                "Minimum hillshade brightness in [0..1]. "
+                "0 leaves shadows unchanged."
+            ),
+        )
+        parser.add_argument(
+            "--hill-gamma",
+            type=float,
+            default=1.0,
+            help=(
+                "Gamma applied to normalized hillshade. "
+                "1 leaves unchanged; >1 lifts shadows; <1 deepens shadows."
+            ),
+        )
+        parser.add_argument(
+            "--hill-ceil",
+            type=float,
+            default=1.0,
+            help=(
+                "Maximum hillshade brightness in [0..1]. "
+                "1 leaves highlights unchanged."
+            ),
+        )
+        parser.add_argument(
+            "--shade-strength",
+            type=float,
+            default=0.8,
+            help=(
+                "Global hillshade strength in [0..1]. "
+                "1 applies full shading; lower values reduce shading."
+            ),
+        )
+
+    def execute(self) -> None:
+        from GDALHelper.hillshade_blend import Hillshade
+        hillshade = Hillshade(self.args)
+        hillshade.blend()
+        self.print_verbose(f"✅ Wrote hillshade raster: {self.args.output}")
+
+@register_command("feather")
+class FeatherRaster(IOCommand):
+    """
+    Applies 'Edge Feathering' to a mask or alpha raster.
+
+    This command uses a Euclidean Distance Transform (EDT) to calculate a
+    Gaussian-style falloff based on proximity to the feature's edge.
+
+    It is a perimetric operation: the interior of the mask remains 100%
+    opaque (solid), while the edges fade smoothly into the background.
+
+    Usage:
+      Use this for vignettes, map borders, or blending categorical
+      polygons where you want a soft transition but a solid interior.
+    """
+
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
+        super(FeatherRaster, FeatherRaster).add_arguments(parser)
+
+        parser.add_argument(
+            "--sigma",
+            type=float,
+            default=SIGMA_DEFAULT,
+            help=f"Gaussian falloff distance. Default: {SIGMA_DEFAULT}",
+        )
+        parser.add_argument(
+            "--truncate",
+            type=float,
+            default=GAUSSIAN_TRUNCATE_DEFAULT,
+            help=f"Distance multiplier used for tile padding. Default: {GAUSSIAN_TRUNCATE_DEFAULT}",
+        )
+        parser.add_argument(
+            "--tile-size",
+            type=int,
+            default=TILE_SIZE_DEFAULT,
+            help=f"Output tile size. Default: {TILE_SIZE_DEFAULT}",
+        )
+        parser.add_argument(
+            "--band",
+            type=int,
+            default=1,
+            help="Input band to use as the mask source. Default: 1",
+        )
+        parser.add_argument(
+            "--co",
+            action="append",
+            help="Creation option, e.g. COMPRESS=DEFLATE",
+        )
+
+    def transform(self) -> None:
+        feather(self.args)
+
+
+@register_command("overlay_layers")
+class OverlayLayers(IOCommand):
+    """Overlay raster or vector layers onto a base raster.
+
+    The base raster defines the output grid. Each overlay replaces matching
+    pixels in the current result. Overlays are applied from left to right, so
+    later overlays take precedence where layers overlap.
+
+    GeoTIFF overlays must already match the base CRS, extent, resolution, and
+    pixel alignment. GeoPackage overlays are rasterized onto the base grid.
+
+    By default, every valid non-NoData overlay value is copied. If one or more
+    ``--value`` arguments are supplied, only those values are copied.
+
+    Examples:
+        gdal-helper overlay_layers \
+            EVT_themed.tif EVT_corrections.gpkg \
+            -o EVT_corrected.tif \
+            --value 1
+
+        gdal-helper overlay_layers \
+            base.tif corrections.gpkg extra.tif \
+            -o output.tif \
+            --value 1 --value 3
+    """
+
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
+        """Register command-line arguments.
+
+        Args:
+            parser: Parser used to register the command arguments.
+        """
+        parser.add_argument(
+            "input",
+            help="Base single-band raster defining the  grid.",
+        )
+        parser.add_argument(
+            "overlays",
+            nargs="+",
+            help="GeoTIFF or GeoPackage overlays, applied left to right.",
+        )
+        parser.add_argument(
+            "output",
+            help="Output GeoTIFF.",
+        )
+        parser.add_argument(
+            "--value",
+            dest="values",
+            action="append",
+            type=int,
+            help=(
+                "Category value to copy from overlays. Repeat to allow multiple "
+                "values. If omitted, all valid overlay values are copied."
+            ),
+        )
+        parser.add_argument(
+            "--attribute",
+            help=(
+                "GeoPackage attribute containing the category value. "
+            ),
+        )
+        parser.add_argument(
+            "--co",
+            action="append",
+            help="GeoTIFF creation option, e.g. COMPRESS=DEFLATE.",
+        )
+
+    def transform(self) -> None:
+        """Run the overlay operation."""
+        overlay_layers(self.args)
+        self.print_verbose(f"✅ Wrote overlaid raster: {self.args.output}")
+
+@register_command("buffered_vector_mask")
+class BufferedVectorMask(Command):
+    """Create an aligned binary raster mask from buffered vector features."""
+
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
+        buffered_vector_mask_add_args(parser)
+
+    def execute(self) -> None:
+        config = BufferedVectorMaskConfig.from_args(self.args)
+        create_buffered_vector_mask(
+            config,
+            run_command=self._run_command,
+            print_verbose=self.print_verbose,
+        )
+
+
+@register_command("inpaint_raster")
+class InpaintRaster(Command):
+    """Reconstruct selected raster pixels from surrounding valid values."""
+
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
+        inpaint_raster_add_args(parser)
+
+    def execute(self) -> None:
+        config = InpaintRasterConfig.from_args(self.args)
+        inpaint_raster(config, print_verbose=self.print_verbose)
+
+
+
 
 @register_command("adjust_color_file")
 class AdjustColorFile(IOCommand):
@@ -122,7 +597,6 @@ class AdjustColorFile(IOCommand):
             max_hue=self.args.max_hue, target_hue=self.args.target_hue,
             elev_adjust=self.args.elev_adjust
         )
-
 
 @register_command("manifest")
 class CreateManifest(Command):
@@ -172,9 +646,6 @@ class CreateSubset(IOCommand):
         )
 
     def transform(self):
-        self.print_verbose(
-            f"--- Creating subset from '{self.args.input}' to '{self.args.output}' ---"
-        )
         width, height = _get_image_dimensions(self.args.input)
         if self.args.size > min(width, height):
             x_offset, y_offset, w, h = 0, 0, width, height
@@ -190,18 +661,16 @@ class CreateSubset(IOCommand):
 
 @register_command("reclassify")
 class Reclassify(IOCommand):
-    """Reclassify a categorical raster into a compact uint8 class raster (optional palette + alpha).
+    """Reclassify a categorical raster into a compact uint8 class raster.
 
-    This command is designed to reduce large categorical rasters (e.g., LandFire EVT/FBFM/etc.)
-    into a small number of derived classes, stored as uint8 values.
+    The command reduces a large categorical raster into a small number of
+    configured output classes.
 
-    - The main OUTPUT is a 1-band uint8 raster containing class values.
-    - If enabled (default), a sidecar alpha raster is written with 255 where any rule matched,
-      and 0 where no rule matched.
-    - If any `rgb` entries exist in the config, an embedded GeoTIFF palette is written
-      so tools like QGIS can render it as a paletted/classified raster.
+    - The main output is a single-band uint8 GeoTIFF containing class values.
+    - If enabled, a sidecar alpha raster contains 255 where a class matched
+      and 0 where no class matched.
 
-    See `_parse_reclass_config` docstring for the YAML schema.
+    See `_parse_reclass_config` for the YAML schema.
     """
 
     @staticmethod
@@ -219,25 +688,21 @@ class Reclassify(IOCommand):
         cfg = _load_yaml(Path(self.args.config))
         rules, options = _parse_reclass_config(cfg)
 
-        _validate_no_duplicate_ids(rules)
-
         out_path = Path(self.args.output)
         if options.write_alpha:
             alpha_path = _derive_alpha_path(out_path, options.alpha_output)
         else:
             alpha_path = None
 
-        palette = _build_palette(rules)
-
         try:
             _reclassify_and_output(
                 src_path=str(self.args.input), out_path=out_path, alpha_path=alpha_path,
-                rules=rules, options=options, palette=palette, )
+                rules=rules, options=options
+            )
 
-            if hasattr(self, "print_verbose"):
-                self.print_verbose(f"✅ Wrote class raster: {out_path}")
-                if alpha_path is not None:
-                    self.print_verbose(f"✅ Wrote alpha raster: {alpha_path}")
+            self.print_verbose(f"✅ Wrote class raster: {out_path}")
+            if alpha_path is not None:
+                self.print_verbose(f"✅ Wrote alpha raster: {alpha_path}")
 
         except Exception:
             out_path.unlink(missing_ok=True)
@@ -246,11 +711,144 @@ class Reclassify(IOCommand):
             raise
 
 
+@register_command("lookup_raster")
+class LookupRaster(IOCommand):
+    """Create a raster by looking up source pixel values in a DBF or CSV table.
+
+    Each integer source pixel is treated as a lookup key. The matching value
+    from the selected table field is written to the output raster.
+
+    Example:
+
+        Value -> Lit_Val
+
+    This is useful for categorical rasters whose pixel values reference an
+    external attribute table, such as ArcGIS Raster Attribute Tables
+    (`.vat.dbf`).
+    """
+
+    @staticmethod
+    def add_arguments(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--table", required=True, help="Lookup table (.dbf or .csv).", )
+        parser.add_argument(
+            "--key-field", required=True, help="Table field matching source raster pixel values.", )
+        parser.add_argument(
+            "--value-field", required=True,
+            help="Numeric table field written to the output raster.", )
+        parser.add_argument(
+            "--default-value", type=_parse_default_value, default=None,
+            help=("Output nodata value used when a source ID has no table value. "
+                  "A non-conflicting value is selected automatically if omitted."), )
+        parser.add_argument(
+            "--dtype", dest="output_dtype", default=None,
+            help="Optional output dtype, e.g. uint8, uint16, int32, float32.", )
+        parser.add_argument(
+            "--input-nodata", action="append", default=None,
+            help="Additional source nodata ID(s), comma-separated or repeated.", )
+        parser.add_argument(
+            "--tile-size", type=int, default=TILE_SIZE_DEFAULT,
+            help=f"Output GeoTIFF tile size. Default: {TILE_SIZE_DEFAULT}.", )
+        parser.add_argument(
+            "--compress", default=COMPRESS_DEFAULT,
+            help=f"GeoTIFF compression. Default: {COMPRESS_DEFAULT}.", )
+        parser.add_argument(
+            "--report-unmapped", action="store_true",
+            help="Report a sample of source IDs absent from the lookup table.", )
+        parser.add_argument(
+            "--max-unmapped-ids", type=int, default=DEFAULT_MAX_UNMAPPED_IDS,
+            help=("Maximum number of unmapped source IDs to report. "
+                  f"Default: {DEFAULT_MAX_UNMAPPED_IDS}."), )
+        parser.add_argument(
+            "--max-lookup-key", type=int, default=DEFAULT_MAX_LOOKUP_KEY,
+            help=("Safety limit for the largest dense lookup key. "
+                  f"Default: {DEFAULT_MAX_LOOKUP_KEY}."), )
+
+        parser.add_argument("input", help="Source integer categorical raster.")
+        parser.add_argument("output", help="Output raster.")
+
+    def transform(self) -> None:
+        """Orchestrate table lookup and output raster creation."""
+        out_path = Path(self.args.output)
+
+        options = LookupRasterOptions(
+            tile_size=self.args.tile_size, compress=self.args.compress,
+            default_value=self.args.default_value, output_dtype=self.args.output_dtype,
+            input_nodata=_parse_input_nodata(self.args.input_nodata),
+            report_unmapped=self.args.report_unmapped, max_unmapped_ids=self.args.max_unmapped_ids,
+            max_lookup_key=self.args.max_lookup_key, )
+
+        lookup_raster(
+            src_path=self.args.input, out_path=out_path, table_path=self.args.table,
+            key_field=self.args.key_field, value_field=self.args.value_field, options=options, )
+        self.print_verbose(f"✅ Wrote lookup raster: {out_path}")
+
+
+
+@register_command("smooth_categories")
+class SmoothCategories(IOCommand):
+    """
+    Cleans and smooths categorical rasters using a neighborhood-aware
+    'Winner-Take-All' algorithm.
+
+    This command uses a YAML config to identify which
+    categorical values should be smoothed and by how much.
+    nodata_value
+    """
+
+    @staticmethod
+    def add_arguments(parser):
+        super(SmoothCategories, SmoothCategories).add_arguments(parser)
+        parser.add_argument(
+            "--config", type=str, required=True,
+            help="Path to YAML file containing 'classes' with 'smoothing_radius'."
+        )
+        parser.add_argument(
+            "--claim-threshold", type=float, default=0.2,
+            help="Minimum support required for a theme to claim a pixel. Default: 0.2"
+        )
+        parser.add_argument(
+            "--median-threshold", type=float, default=1.5,
+            help="Radius threshold to trigger pre-smoothing median filter. Default: 1.5"
+        )
+
+    def transform(self):
+        # 1. Parse the config using the standard reclass parser
+        cfg = _load_yaml(Path(self.args.config))
+        rules, options = _parse_reclass_config(cfg)
+
+        # 2. Extract smoothing radii from the raw YAML classes
+        # We map the 'value' (output ID) to the 'smoothing_radius'
+        smooth_map = {}
+        raw_classes = cfg.get("classes", [])
+
+        for i, rule in enumerate(rules):
+            # We match the rule to the raw item to get the radius
+            raw_item = raw_classes[i]
+            radius = float(raw_item.get("smoothing_radius", 0.0))
+            smooth_map[rule.value] = radius
+
+        # 3. Calculate required padding (Ghost Halo)
+        max_sigma = max(smooth_map.values()) if smooth_map else 0
+        pad_size = int(max_sigma * 3.0) + 2
+
+        self.print_verbose(f"Smoothing {len(smooth_map)} categories. Max Sigma: {max_sigma}")
+
+        # 4. Hand off to the Tiled Orchestrator
+        run_tiled_kernel(
+            input_path=self.args.input, output_path=self.args.output,
+            kernel_fn=smooth_categories_kernel, pad=pad_size, tile_size=options.tile_size,
+            # Logic Params
+            smooth_map=smooth_map, background_id=options.default_value,
+            claim_threshold=self.args.claim_threshold, median_threshold=self.args.median_threshold
+        )
+
+
 @register_command("publish")
 class Publish(Command):
     """Publish a file locally or via SCP, optionally stamping Git version metadata first.
 
-    Marker file is created only if the publish action completes successfully.
+    Marker file is created  if the publish action completes successfully or --disable is set.
     """
 
     @staticmethod
@@ -279,11 +877,11 @@ class Publish(Command):
     def execute(self) -> None:
         src_path = Path(self.args.source_file)
         if not src_path.exists():
-            raise RuntimeError(f"❌ Source file does not exist: {src_path}")
+            raise FileError(f"Source file does not exist: '{src_path}'")
 
         dest_name = self.args.rename if self.args.rename else src_path.name
         if not dest_name:
-            raise RuntimeError("❌ Destination filename resolved to empty string.")
+            raise ConfigurationError("Destination filename resolved to an empty string.")
 
         if self.args.stamp_version:
             self._stamp_version_or_fail(src_path)
@@ -301,10 +899,8 @@ class Publish(Command):
         self.print_verbose(f"--- Stamping version on '{src_path}' ---")
         git_hash = get_git_hash()
         if not git_hash:
-            raise RuntimeError("❌ Cannot stamp version: not in a git repo or git not available.")
-        # Optional: if you ever want to forbid dirty in Publish, enforce here.
-        # if git_hash.endswith("-dirty"):
-        #     raise RuntimeError("❌ Cannot stamp version: repo has uncommitted changes.")
+            raise CommandError("Cannot stamp version: Git is unavailable or the source is not inside a Git repository.")
+
         set_tiff_version(str(src_path), git_hash)
 
     def _publish_or_fail(self, src_path: Path, dest_name: str) -> None:
@@ -322,21 +918,26 @@ class Publish(Command):
         dest_dir_path = Path(dest_dir)
         self.print_verbose(f"--- Publishing '{src_path}' to local directory '{dest_dir_path}' ---")
         if not dest_dir_path.exists():
-            raise RuntimeError(f"❌ Destination directory does not exist: {dest_dir_path}")
+            raise FileError(f"Destination directory does not exist: '{dest_dir_path}'")
         if not dest_dir_path.is_dir():
-            raise RuntimeError(f"❌ Destination is not a directory: {dest_dir_path}")
+            raise FileError(f"Destination is not a directory: '{dest_dir_path}'")
 
         dest_path = dest_dir_path / dest_name
         if dest_path.exists() and not self.args.overwrite:
-            raise RuntimeError(f"❌ Destination exists (use --overwrite to allow): {dest_path}")
+            raise FileError(f"Destination already exists: '{dest_path}'. Use --overwrite to replace it.")
 
         command = ["cp", str(src_path), str(dest_path)]
         self._run_command(command)
 
     def _create_marker_or_fail(self, marker_path: Path) -> None:
         self.print_verbose(f"--- Creating marker file at '{marker_path}' ---")
-        marker_path.parent.mkdir(parents=True, exist_ok=True)
-        marker_path.touch()
+        try:
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.touch()
+        except OSError as exc:
+            raise FileError(
+                f"Could not create marker file '{marker_path}': {exc}"
+            ) from exc
         self.print_verbose("--- Marker file created. ---")
 
 
@@ -350,17 +951,23 @@ class AddVersion(Command):
 
     def execute(self):
         git_hash = get_git_hash()
+        if not git_hash:
+            raise CommandError(
+                "Cannot stamp version: Git is unavailable or the target is not inside a Git repository."
+            )
+
         self.print_verbose(
             f"--- Stamping version on '{self.args.target_file}' Version: {git_hash} ---"
         )
+
         try:
             set_tiff_version(self.args.target_file, git_hash)
-            self.print_verbose("--- Version stamping complete. ---")
-        except RuntimeError as e:
-            # Catch the error from set_tiff_version to print a clean message
-            print(str(e))
-            # Re-raise if you want the build pipeline to actually fail
-            raise
+        except RuntimeError as exc:
+            raise FileError(
+                f"Could not write version metadata to '{self.args.target_file}': {exc}"
+            ) from exc
+
+        self.print_verbose("--- Version stamping complete. ---")
 
 
 @register_command("get_version")
@@ -381,6 +988,131 @@ class GetVersion(Command):
                 print("   ⚠️  This file was built from a repository with uncommitted changes.")
         else:
             print(f"❌ No git version information found in '{self.args.target_file}'.")
+
+@register_command("aligned_rasterize")
+class AlignedRasterize(Command):
+    """
+    Rasterizes a vector layer so the output matches a template raster's
+    SRS, extent, and resolution.
+
+    The source vector must already use the same CRS as the template raster.
+    """
+
+    @staticmethod
+    def add_arguments(parser):
+        parser.add_argument(
+            "source",
+            help="The vector datasource to rasterize (e.g., a GeoPackage)."
+        )
+        parser.add_argument(
+            "template",
+            help="The raster file with the desired output grid."
+        )
+        parser.add_argument(
+            "output",
+            help="The path for the new, aligned raster output."
+        )
+
+        value_group = parser.add_mutually_exclusive_group(required=True)
+        value_group.add_argument(
+            "-a", "--attribute",
+            help="Vector attribute whose value is burned into the raster."
+        )
+        value_group.add_argument(
+            "--burn",
+            type=float,
+            help="Constant value to burn into all rasterized features."
+        )
+
+        parser.add_argument(
+            "--init",
+            type=float,
+            default=0,
+            help="Initial value for pixels not covered by features. Default: 0."
+        )
+        parser.add_argument(
+            "--nodata",
+            type=float,
+            help="Set the output raster NoData value."
+        )
+        parser.add_argument(
+            "--type",
+            default="Byte",
+            choices=[
+                "Byte", "Int8", "UInt16", "Int16",
+                "UInt32", "Int32", "UInt64", "Int64",
+                "Float32", "Float64",
+            ],
+            help="Output raster datatype. Default: Byte."
+        )
+        parser.add_argument(
+            "--layer",
+            help="Input vector layer name."
+        )
+        parser.add_argument(
+            "--all-touched",
+            action="store_true",
+            help="Burn all pixels touched by a polygon."
+        )
+        parser.add_argument(
+            "--co",
+            action="append",
+            metavar="NAME=VALUE",
+            help="Creation option for the output driver."
+        )
+
+    def execute(self):
+        template_info = _get_raster_info(self.args.template)
+
+        x_res, y_res = template_info["resolution"]
+        xmin, ymin, xmax, ymax = template_info["extent"]
+        srs_wkt = template_info["srs_wkt"]
+
+        x_res = abs(x_res)
+        y_res = abs(y_res)
+
+        self.print_verbose(
+            f"--- Rasterizing '{self.args.source}' "
+            f"to match '{self.args.template}' ---"
+        )
+
+        command = [
+            "gdal_rasterize",
+            "-a_srs", srs_wkt,
+            "-te",
+            str(xmin), str(ymin), str(xmax), str(ymax),
+            "-tr",
+            str(x_res), str(y_res),
+            "-ot", self.args.type,
+            "-init", str(self.args.init),
+        ]
+
+        if self.args.attribute:
+            command.extend(["-a", self.args.attribute])
+        else:
+            command.extend(["-burn", str(self.args.burn)])
+
+        if self.args.nodata is not None:
+            command.extend(["-a_nodata", str(self.args.nodata)])
+
+        if self.args.layer:
+            command.extend(["-l", self.args.layer])
+
+        if self.args.all_touched:
+            command.append("-at")
+
+        if self.args.co:
+            for option in self.args.co:
+                command.extend(["-co", option])
+
+        command.extend([
+            self.args.source,
+            self.args.output,
+        ])
+
+        self._run_command(command)
+
+        self.print_verbose("--- Vector rasterized and aligned successfully. ---")
 
 
 @register_command("align_raster")
@@ -447,7 +1179,7 @@ class MaskedBlend(Command):
     def execute(self):
         import rasterio
 
-        self.print_verbose(f"--- Blending (Windowed) to {self.args.output} ---")
+        self.print_verbose(f"--- Masked Blending  to {self.args.output} ---")
 
         try:
             with rasterio.open(self.args.layerA) as src_a, rasterio.open(
@@ -456,7 +1188,7 @@ class MaskedBlend(Command):
 
                 # Validation
                 if src_a.width != src_b.width:
-                    raise ValueError("Dimensions mismatch.")
+                    raise ConfigurationError("Blend input dimensions do not match.")
 
                 # Profile Setup
                 profile = src_a.profile.copy()
@@ -503,507 +1235,194 @@ class MaskedBlend(Command):
 
             print(f"\n✅ Created {self.args.output}")
 
-        except Exception as e:
-            print(f"\n❌ Blend Failed: {e}")
+        except Exception:
             Path(self.args.output).unlink(missing_ok=True)
             raise
 
 
-TILE_SIZE_DEFAULT = 256
-COMPRESS_DEFAULT = "deflate"
-SIGMA_DEFAULT = 1.0
-PAD_TRUNCATE_DEFAULT = 2.5  # 2.5*sigma is usually plenty for cartographic masks
+SIGMA_CUTOFF = 30.0
+SCALE = 4  # Downsample by 4x (or 8x for sigma 80)
 
 
-@register_command("blur")
-class BlurRaster(IOCommand):
-    """Applies Gaussian Blur to a raster using windowed processing.
+@register_command("haze")
+class HazeRaster(IOCommand):
+    """
+    Performs a global 'Gaussian Convolution' (Low-Pass Filter) on a raster.
 
-    Optimized for sparse masks:
-      - Skips work if the *padded* read window is all zeros (safe).
-      - Uses a smaller halo (truncate=3*sigma) by default.
-      - Preallocates scratch buffers based on band count and halo size.
-      - Uses SciPy output= to avoid allocations.
+    This command applies a Gaussian blur across all bands.
+    It replaces every pixel value with a weighted average of its neighborhood,
+    effectively 'melting' both the interior and exterior of features. It is
+    designed to remove high-frequency detail and create smooth, continuous surfaces.
+
+    Usage:
+      - Creating 'Hazy' geological transitions or atmospheric effects.
+      - General-purpose low-pass filtering to reduce high-frequency data noise.
+      - Preparing high-resolution data for use as a soft environmental signal.
+      - Softening boundaries where a 'melted' look is preferred over
+        a simple perimeter feather.
+
+    Capabilities:
+      - Supports multi-band (RGB/RGBA) and single-band rasters.
+      - Supports multiple data types (Byte, Float32, etc.).
     """
 
     @staticmethod
-    def add_arguments(parser: argparse.ArgumentParser) -> None:
-        super(BlurRaster, BlurRaster).add_arguments(parser)
-        parser.add_argument("--sigma", type=float, default=SIGMA_DEFAULT)
-        # Optional knob; keep default fast/sane.
-        parser.add_argument("--truncate", type=float, default=PAD_TRUNCATE_DEFAULT)
-        # Allow overriding compression/tile size if you ever need it.
-        parser.add_argument("--compress", type=str, default=COMPRESS_DEFAULT)
-        parser.add_argument("--tile-size", type=int, default=TILE_SIZE_DEFAULT)
-
-    def transform(self) -> None:
-        # Late imports keep dependencies local to this command.
-        from pathlib import Path
-
-        import numpy as np
-        import rasterio
-        from rasterio.enums import ColorInterp
-        from rasterio.windows import Window
-        from scipy.ndimage import distance_transform_edt
-        from tqdm import tqdm
-
-        sigma = float(self.args.sigma)
-        truncate = float(self.args.truncate)
-        pad = _compute_pad(sigma, truncate)
-
-        tile_size = int(self.args.tile_size)
-        if tile_size <= 0:
-            raise ValueError("tile-size must be > 0.")
-
-        out_path = Path(self.args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        self.print_verbose(
-            f"--- Edge-feather '{self.args.input}' (sigma={sigma}, truncate={truncate}) ---"
+    def add_arguments(parser):
+        super(HazeRaster, HazeRaster).add_arguments(parser)
+        parser.add_argument(
+            "--sigma", type=float, default=2.0,
+            help="Standard deviation for Gaussian kernel (in pixels). Default: 2.0"
+        )
+        parser.add_argument(
+            "--normalize", action="store_true",
+            help="If set, the output will be stretched back to the full 0-1 (or 0-255) range."
+        )
+        parser.add_argument(
+            "--co", action="append",
+            help="Creation options for the output driver (e.g., 'COMPRESS=DEFLATE')."
         )
 
-        # For mask feathering, treat "absence" as 0.
-        ALPHA_OFF = 0
-        ALPHA_ON = 255
+    def _warn_about_integer_haze_input(self, src) -> None:
+        """Warn when integer input is likely to lose the Gaussian transition."""
+        from rasterio.enums import Resampling
 
-        try:
-            with rasterio.open(self.args.input) as src:
-                if int(src.count) != 1:
-                    raise RuntimeError(
-                        "❌ edge-feather blur expects a single-band mask/alpha raster. "
-                        f"Found {src.count} bands."
-                    )
+        source_dtype = np.dtype(src.dtypes[0])
+        if not np.issubdtype(source_dtype, np.integer):
+            return
 
-                # Output is a single-band uint8 alpha-like raster.
-                profile = src.profile.copy()
-                profile.update(
-                    {
-                        "driver": "GTiff", "dtype": "uint8", "count": 1, "nodata": ALPHA_OFF,
-                        "compress": "deflate", "tiled": True, "blockxsize": tile_size,
-                        "blockysize": tile_size, "SPARSE_OK": "YES",
-                    }
+        sample_height = min(src.height, 512)
+        sample_width = min(src.width, 512)
+        sample = src.read(
+            1, out_shape=(sample_height, sample_width), resampling=Resampling.nearest,
+            masked=True, )
+
+        valid = sample.compressed()
+        if valid.size:
+            sample_min = int(valid.min())
+            sample_max = int(valid.max())
+
+            if sample_max - sample_min <= 1 and sample_max <= 1:
+                self.print_verbose(
+                    "⚠️ Haze input has very low integer range "
+                    f"(sample min={sample_min}, max={sample_max}, dtype={source_dtype.name}). "
+                    "Gaussian blur produces fractional values that may be lost when "
+                    f"written back to {source_dtype.name}. For a Byte processing mask, "
+                    "consider using 0/255 values or a floating-point output."
                 )
 
-                # Remove stale output (fail-fast on directories is handled by your guard helpers
-                # elsewhere).
-                out_path.unlink(missing_ok=True)
+        # src.nodata = None
 
-                with rasterio.open(out_path, "w", **profile) as dst:
-                    # Hint QGIS that this is alpha-like.
-                    dst.colorinterp = (ColorInterp.alpha,)
+        """if src.nodata == 0:
+            self.print_verbose(
+                "⚠️ Haze input uses nodata=0. This haze operation reads the stored "
+                "pixel values directly, so nodata pixels containing 0 participate "
+                "numerically in the Gaussian blur. For a processing mask, consider "
+                "using 0 as valid background and reserving nodata for areas outside "
+                "the data domain."
+            )"""
 
-                    total = _block_window_total(dst, band_index=1)
-
-                    # Preallocate max buffers (views for edge tiles)
-                    read_h_max = tile_size + 2 * pad
-                    read_w_max = tile_size + 2 * pad
-
-                    scratch_u8_max = np.empty((read_h_max, read_w_max), dtype=np.uint8)
-                    out_full_u8_max = np.empty((read_h_max, read_w_max), dtype=np.uint8)
-                    out_tile_u8_max = np.empty((tile_size, tile_size), dtype=np.uint8)
-
-                    # distance_transform_edt output (float64 is expected/typical)
-                    dist_max = np.empty((read_h_max, read_w_max), dtype=np.float64)
-                    alpha_f_max = np.empty((read_h_max, read_w_max), dtype=np.float32)
-
-                    inv_two_sigma2 = np.float32(1.0 / (2.0 * sigma * sigma))
-
-                    win_iter = (w for _, w in dst.block_windows(1))
-                    for window in tqdm(
-                            win_iter, total=total, unit="block", desc="   Feathering", leave=False,
-                            mininterval=10.0, ):
-                        out_h = int(window.height)
-                        out_w = int(window.width)
-                        read_h = out_h + 2 * pad
-                        read_w = out_w + 2 * pad
-
-                        scratch_u8 = scratch_u8_max[:read_h, :read_w]
-                        out_full_u8 = out_full_u8_max[:read_h, :read_w]
-                        out_tile_u8 = out_tile_u8_max[:out_h, :out_w]
-                        dist = dist_max[:read_h, :read_w]
-                        alpha_f = alpha_f_max[:read_h, :read_w]
-
-                        read_window = Window(
-                            col_off=window.col_off - pad, row_off=window.row_off - pad,
-                            width=read_w, height=read_h, )
-
-                        # Read padded mask into scratch.
-                        # boundless fill uses ALPHA_OFF to make edges deterministic.
-                        data = src.read(
-                            1, window=read_window, boundless=True, fill_value=ALPHA_OFF, )
-                        np.copyto(scratch_u8, data, casting="unsafe")
-
-                        # ✅ Safe skip: padded area has no signal => output tile is all-off.
-                        # For sparse GTiff, don't write empty tiles.
-                        if not np.any(scratch_u8):
-                            continue
-
-                        # feature = True where mask is on
-                        feature = scratch_u8 != ALPHA_OFF
-
-                        # If everything is on, output is all-on (still sparse-unfriendly, but rare).
-                        if feature.all():
-                            out_tile_u8.fill(ALPHA_ON)
-                            dst.write(out_tile_u8, window=window, indexes=1)
-                            continue
-
-                        # Compute distance for background pixels to nearest feature pixel.
-                        # distance_transform_edt computes distances for non-zero pixels to
-                        # nearest zero.
-                        # Use (~feature): background True, feature False (zeros).
-                        distance_transform_edt(~feature, distances=dist)
-
-                        # alpha_f = exp(-(d^2)/(2*sigma^2)) * 255
-                        np.multiply(dist, dist, out=alpha_f, casting="unsafe")  # alpha_f = d^2
-                        alpha_f *= -inv_two_sigma2  # alpha_f = -(d^2)/(2*s^2)
-                        np.exp(alpha_f, out=alpha_f)  # alpha_f = exp(...)
-                        alpha_f *= np.float32(255.0)
-
-                        # Force feature pixels to fully on
-                        alpha_f[feature] = np.float32(255.0)
-
-                        # Cast to uint8 into padded output buffer
-                        np.clip(alpha_f, 0.0, 255.0, out=alpha_f)
-                        np.copyto(out_full_u8, alpha_f, casting="unsafe")
-
-                        # Crop padded -> tile
-                        cropped = out_full_u8[pad: pad + out_h, pad: pad + out_w]
-                        np.copyto(out_tile_u8, cropped, casting="unsafe")
-
-                        # Keep output sparse: skip writing all-off tiles
-                        if not np.any(out_tile_u8):
-                            continue
-
-                        dst.write(out_tile_u8, window=window, indexes=1)
-
-            self.print_verbose(f"✅ Created Edge Feather: {out_path}")
-
-        except Exception:
-            out_path.unlink(missing_ok=True)
-            raise
-
-
-@register_command("hillshade_blend")
-class HillshadeBlend(Command):
-    """Blend a grayscale hillshade onto a color relief using texture-shading logic.
-
-    The blend is primarily a multiplicative shading (like Photoshop "Multiply"):
-
-        out = rgb * hill
-
-    To preserve color saturation and avoid harsh clipping in deep shadows and bright highlights,
-    this command can reduce shading near extremes using smooth "protection" ramps.
-
-    Protection model (intuitive):
-        multiplier = hill + w * (1 - hill)
-
-    where w is a protection weight (0..1). When w=0, you get standard shading. When w=1, the
-    multiplier becomes 1 (no shading), so the original color is preserved.
-
-    Optional hillshade tone mapping (floor/gamma/ceil) can be applied before blending to lift
-    blacks or tame highlights without adding extra pipeline steps.
-
-    Args:
-        hillshade: Input hillshade raster (1-band preferred). Can be uint8/uint16/float.
-        color: Input RGB/RGBA color raster.
-        output: Output path.
-
-    Raises:
-        ValueError: If dimensions mismatch or parameters are invalid.
-        RuntimeError: If processing fails and the output cannot be written.
-    """
-
-    # ---------- Named constants ----------
-    _BYTE_MAX = 255.0
-    _DEFAULT_BLOCK_SIZE = 256
-    _HILL_FLOAT_ASSUME_MAX = 1.0
-    _HILL_FLOAT_MAX_CUTOFF = 1.5  # if sample max <= this, treat float hillshade as 0..1
-    _HILL_SAMPLE_WINDOWS = 6  # small sample for robust normalization
-    _NODATA_INPAINT_SEARCH_DIST = 100.0
-
-    @staticmethod
-    def add_arguments(parser) -> None:
-        parser.add_argument("hillshade", help="Input Hillshade")
-        parser.add_argument("color", help="Input Color Image (RGB or RGBA)")
-        parser.add_argument("output", help="Output path")
-        parser.add_argument(
-            "--co", action="append", help="Creation options (e.g., COMPRESS=DEFLATE)"
-        )
-
-        # v2 API: protection is strength + range (smooth ramps)
-        parser.add_argument(
-            "--protect-shadows", type=float, default=0.2,
-            help="Shadow protection strength in [0..1]. 0 disables. "
-                 "Typical: 0.2–0.6 to prevent inky blacks.", )
-        parser.add_argument(
-            "--protect-highlights", type=float, default=0.10,
-            help="Highlight protection strength in [0..1]. 0 disables. "
-                 "Typical: 0.05–0.25 to prevent washed highlights.", )
-        parser.add_argument(
-            "--shadow-range", type=int, nargs=2, metavar=("START", "END"), default=[0, 60],
-            help="Shadow protection ramp in hillshade byte-space [0..255]. "
-                 "Full protection near START, fades to none by END. Example: 0 60.", )
-        parser.add_argument(
-            "--highlight-range", type=int, nargs=2, metavar=("START", "END"), default=[220, 255],
-            help="Highlight protection ramp in hillshade byte-space [0..255]. "
-                 "No protection until START, ramps to full by END. Example: 225 255.", )
-
-        # Optional hillshade tone mapping (no behavior change by default)
-        parser.add_argument(
-            "--hill-floor", type=float, default=0.0,
-            help="Lift shadows by enforcing a minimum hillshade brightness in [0..1]. "
-                 "0 leaves unchanged; ~0.06–0.12 is common for harsh hillshades.", )
-        parser.add_argument(
-            "--hill-gamma", type=float, default=1.0,
-            help="Gamma curve applied to normalized hillshade in [0..1]. "
-                 "1 leaves unchanged; >1 lifts shadows; <1 deepens shadows.", )
-        parser.add_argument(
-            "--hill-ceil", type=float, default=1.0,
-            help="Optional maximum hillshade brightness in [0..1] after tone mapping. "
-                 "1 leaves unchanged; <1 can reduce blown highlights.", )
-        parser.add_argument(
-            "--shade-strength", type=float, default=0.8,
-            help="Global hillshade strength in [0..1]. "
-                 "1 applies full shading; lower values lift shadows everywhere. "
-                 "Typical: 0.55–0.85 (snow/white terrain often likes 0.55–0.70).", )
-
-    def execute(self) -> None:
+    def transform(self):
         import rasterio
+        from rasterio.enums import Resampling
+        from scipy.ndimage import gaussian_filter, zoom
 
-        self.print_verbose(
-            f"--- Blending '{self.args.hillshade}' + '{self.args.color}' (Windowed) ---"
-        )
+        input_path = self.args.input
+        output_path = self.args.output
+        sigma = self.args.sigma
 
-        out_path = Path(self.args.output)
-        try:
-            with rasterio.open(self.args.hillshade) as src_h, rasterio.open(
-                    self.args.color
-            ) as src_c:
-                if src_h.width != src_c.width or src_h.height != src_c.height:
-                    raise ValueError("Source dimensions do not match.")
+        if sigma <= 0:
+            raise ConfigurationError("--sigma must be greater than 0.")
 
-                profile = self._setup_profile(src_c)
+        with rasterio.open(input_path) as src:
+            profile = src.profile.copy()
+            bands = src.count
+            height = src.height
+            width = src.width
 
-                out_path.unlink(missing_ok=True)
+            self._warn_about_integer_haze_input(src)
 
-                with rasterio.open(out_path, "w", **profile) as dst:
-                    self._blend_all_windows(src_h, src_c, dst)
+            if sigma > SIGMA_CUTOFF:
+                self.print_verbose(
+                    f"Large Sigma detected ({sigma}). Using Pyramidal Haze (Scale {SCALE}x)."
+                )
 
-            print(f"\n✅ Created {self.args.output}")
-        except Exception as exc:
-            print(f"\n❌ Hillshade Blend Failed: {exc}")
-            out_path.unlink(missing_ok=True)
-            raise
+                new_h, new_w = height // SCALE, width // SCALE
+                new_h, new_w = max(1, new_h), max(1, new_w)
 
-    def _setup_profile(self, src_c):
-        """Prepare output raster profile/metadata based on the color source."""
-        profile = src_c.profile.copy()
-        has_alpha = (src_c.count == 4)
-        out_count = 4 if has_alpha else 3
+                data_to_blur = src.read(
+                    out_shape=(bands, new_h, new_w), resampling=Resampling.bilinear
+                ).astype(np.float32)
+
+                sigma_effective = sigma / SCALE
+            else:
+                self.print_verbose(
+                    f"Blurring {bands} band(s) with sigma={sigma}..."
+                )
+                data_to_blur = src.read().astype(np.float32)
+                sigma_effective = sigma
+
+        for band_index in range(bands):
+            data_to_blur[band_index] = gaussian_filter(
+                data_to_blur[band_index], sigma=sigma_effective, mode="reflect", )
+
+        if sigma > SIGMA_CUTOFF:
+            z_h = height / data_to_blur.shape[1]
+            z_w = width / data_to_blur.shape[2]
+
+            blurred_data = zoom(
+                data_to_blur, (1, z_h, z_w), order=1, )
+        else:
+            blurred_data = data_to_blur
+
+        if self.args.normalize:
+            for band_index in range(bands):
+                band_min = blurred_data[band_index].min()
+                band_max = blurred_data[band_index].max()
+
+                if band_max - band_min > 1e-6:
+                    blurred_data[band_index] = (blurred_data[band_index] - band_min) / (
+                                band_max - band_min)
+
+                    if profile["dtype"] == "uint8":
+                        blurred_data[band_index] *= 255.0
 
         profile.update(
             {
-                "driver": "GTiff", "count": out_count, "dtype": "uint8", "compress": "deflate",
-                "tiled": True, "blockxsize": self._DEFAULT_BLOCK_SIZE,
-                "blockysize": self._DEFAULT_BLOCK_SIZE, "photometric": "RGB",
+                "driver": "GTiff", "tiled": True, "blockxsize": 256, "blockysize": 256,
+                "compress": "deflate", "nodata": None,
             }
         )
 
-        # Apply creation options from CLI
         if self.args.co:
             for opt in self.args.co:
-                if "=" not in opt:
-                    continue
-                k, v = opt.split("=", 1)
-                key = k.strip().lower()
-                val = v.strip()
-                profile[key] = int(val) if val.isdigit() else val
+                if "=" in opt:
+                    key, val = opt.split("=", 1)
+                    profile[key.lower()] = int(val) if val.isdigit() else val
 
-        # Force YCBCR for JPEG 3-band only
-        if profile.get("compress") == "jpeg" and out_count == 3:
-            if "PHOTOMETRIC" not in str(self.args.co).upper():
-                profile["photometric"] = "YCBCR"
-        else:
-            profile["photometric"] = "RGB"
+        Path(output_path).unlink(missing_ok=True)
+        try:
+            with rasterio.open(output_path, "w", **profile) as dst:
+                dst.write(blurred_data.astype(profile["dtype"]))
 
-        return profile
+            self.print_verbose(f"✅ Created blurred raster: {output_path}")
 
-    def _blend_all_windows(self, src_h, src_c, dst) -> None:
-        """Iterate over windows and write blended output."""
-        self._validate_args()
+        except rasterio.errors.RasterioIOError as exc:
+            Path(output_path).unlink(missing_ok=True)
+            raise FileError(
+                f"Could not write raster '{output_path}': {exc}"
+            ) from exc
 
-        # Determine nodata handling: only inpaint if nodata is actually defined
-        self.nodata_val = src_h.nodata
-        self.has_nodata = (self.nodata_val is not None)
+        except OSError as exc:
+            Path(output_path).unlink(missing_ok=True)
+            raise FileError(
+                f"File error writing '{output_path}': {exc}"
+            ) from exc
 
-        # Robust hillshade normalization denominator
-        self.hill_den = self._infer_hillshade_denominator(src_h, src_c)
-
-        # Precompute protection ramps in normalized space (0..1)
-        s0, s1 = self.args.shadow_range
-        h0, h1 = self.args.highlight_range
-        self.shadow_start = s0 / self._BYTE_MAX
-        self.shadow_end = s1 / self._BYTE_MAX
-        self.highlight_start = h0 / self._BYTE_MAX
-        self.highlight_end = h1 / self._BYTE_MAX
-        self.protect_shadows = float(self.args.protect_shadows)
-        self.protect_highlights = float(self.args.protect_highlights)
-
-        # Tone mapping params
-        self.hill_floor = float(self.args.hill_floor)
-        self.hill_gamma = float(self.args.hill_gamma)
-        self.hill_ceil = float(self.args.hill_ceil)
-
-        windows = list(src_c.block_windows(1))
-        total = len(windows)
-
-        for _, window in tqdm(
-                windows, total=total, unit="block", desc="   Blending", leave=False,
-                mininterval=10.0
-        ):
-            chunk = self._process_single_chunk(src_h, src_c, window)
-            if chunk is not None:
-                dst.write(chunk, window=window)
-
-    def _validate_args(self) -> None:
-        """Validate user parameters."""
-        if not (0.0 <= self.args.protect_shadows <= 1.0):
-            raise ValueError("--protect-shadows must be in [0..1].")
-        if not (0.0 <= self.args.protect_highlights <= 1.0):
-            raise ValueError("--protect-highlights must be in [0..1].")
-
-        s0, s1 = self.args.shadow_range
-        h0, h1 = self.args.highlight_range
-        if not (0 <= s0 <= 255 and 0 <= s1 <= 255 and s0 < s1):
-            raise ValueError("--shadow-range must be two ints in [0..255] with START < END.")
-        if not (0 <= h0 <= 255 and 0 <= h1 <= 255 and h0 < h1):
-            raise ValueError("--highlight-range must be two ints in [0..255] with START < END.")
-
-        if not (0.0 <= self.args.hill_floor <= 1.0):
-            raise ValueError("--hill-floor must be in [0..1].")
-        if not (0.0 < self.args.hill_gamma):
-            raise ValueError("--hill-gamma must be > 0.")
-        if not (0.0 < self.args.hill_ceil <= 1.0):
-            raise ValueError("--hill-ceil must be in (0..1].")
-        if self.args.hill_floor >= self.args.hill_ceil:
-            raise ValueError("--hill-floor must be < --hill-ceil.")
-        if not (0.0 <= self.args.shade_strength <= 1.0):
-            raise ValueError("--shade-strength must be in [0..1].")
-
-    def _infer_hillshade_denominator(self, src_h, src_c) -> float:
-        """Infer a reasonable normalization denominator for hillshade values.
-
-        Integer hillshades: use dtype max (e.g., 255 for uint8, 65535 for uint16).
-        Float hillshades: sample a few windows; if max <= ~1.5 assume 0..1, else assume 0..255.
-        """
-        dtype = np.dtype(src_h.dtypes[0])
-        if np.issubdtype(dtype, np.integer):
-            return float(np.iinfo(dtype).max)
-
-        # Float: sample a few windows from the color raster's tiling for stable behavior
-        windows = list(src_c.block_windows(1))[:self._HILL_SAMPLE_WINDOWS]
-        if not windows:
-            return self._HILL_FLOAT_ASSUME_MAX
-
-        max_vals = []
-        for _, window in windows:
-            arr = src_h.read(1, window=window).astype("float32", copy=False)
-            if np.isfinite(arr).any():
-                max_vals.append(float(np.nanmax(arr)))
-
-        if not max_vals:
-            return self._HILL_FLOAT_ASSUME_MAX
-
-        sample_max = max(max_vals)
-        return self._HILL_FLOAT_ASSUME_MAX if sample_max <= self._HILL_FLOAT_MAX_CUTOFF else (
-            self._BYTE_MAX)
-
-    def _process_single_chunk(self, src_h, src_c, window):
-        """Read, compute, and return blended RGB(A) window."""
-        from rasterio.fill import fillnodata
-
-        rgb = src_c.read([1, 2, 3], window=window)
-        hill = src_h.read(1, window=window)
-
-        if hill.shape != rgb.shape[1:]:
-            return None
-
-        # Inpaint only if hillshade has explicit nodata
-        if self.has_nodata:
-            mask = (hill != self.nodata_val).astype("uint8")
-            hill = fillnodata(hill, mask=mask, max_search_distance=self._NODATA_INPAINT_SEARCH_DIST)
-
-        rgb_f = rgb.astype("float32", copy=False)
-
-        # Normalize hillshade to 0..1
-        hill_f = hill.astype("float32", copy=False) / float(self.hill_den)
-        hill_f = np.clip(hill_f, 0.0, 1.0)
-
-        # Optional tone mapping
-        if self.hill_floor > 0.0 or self.hill_gamma != 1.0 or self.hill_ceil < 1.0:
-            hill_f = self.hill_floor + (1.0 - self.hill_floor) * (hill_f ** self.hill_gamma)
-            if self.hill_ceil < 1.0:
-                hill_f = np.minimum(hill_f, self.hill_ceil)
-            hill_f = np.clip(hill_f, 0.0, 1.0)
-
-        # Compute smooth protection weight
-        w_shadow = self._shadow_weight(hill_f) * self.protect_shadows
-        w_high = self._highlight_weight(hill_f) * self.protect_highlights
-        w = np.maximum(w_shadow, w_high)  # combine
-
-        # Apply protection to multiplier: m = hill + w*(1-hill)
-        strength = float(self.args.shade_strength)
-        strength = np.clip(strength, 0.0, 1.0)
-
-        m = hill_f + w * (1.0 - hill_f)
-        m = np.clip(m, 0.0, 1.0)
-
-        m = (1.0 - strength) + strength * m
-        m = np.clip(m, 0.0, 1.0)
-
-        m_exp = m[None, :, :]
-
-        blended = m_exp * rgb_f
-        blended_u8 = np.round(blended).clip(0, 255).astype("uint8")
-
-        if src_c.count == 4:
-            alpha = src_c.read(4, window=window)
-            return np.concatenate([blended_u8, alpha[None, :, :]], axis=0)
-
-        return blended_u8
-
-    @staticmethod
-    def _smoothstep(edge0: float, edge1: float, x):
-        """Smoothstep interpolation returning 0..1 for x in [edge0..edge1]."""
-
-        # Avoid division by zero
-        if edge1 == edge0:
-            return np.zeros_like(x, dtype="float32")
-        t = (x - edge0) / (edge1 - edge0)
-        t = np.clip(t, 0.0, 1.0)
-        return t * t * (3.0 - 2.0 * t)
-
-    def _shadow_weight(self, hill_f):
-        """Weight 1 in deep shadows, fades to 0 by shadow_end."""
-        # Full protection near shadow_start, zero after shadow_end
-        # w = 1 - smoothstep(start, end, hill)
-        return 1.0 - self._smoothstep(self.shadow_start, self.shadow_end, hill_f)
-
-    def _highlight_weight(self, hill_f):
-        """Weight 0 until highlight_start, ramps to 1 by highlight_end."""
-        return self._smoothstep(self.highlight_start, self.highlight_end, hill_f)
+        except Exception:
+            Path(output_path).unlink(missing_ok=True)
+            raise
 
 
-# Tunables / safety constants
-DEFAULT_OCTAVES = 3
-MIN_FADE_PIXELS = 1
-BASE_SCALE_MIN_PIXELS = 50.0
-ALPHA_MAX = 255.0
-
-
-def _smoothstep01(t: np.ndarray) -> np.ndarray:
-    """Classic smoothstep on [0..1]."""
-    return t * t * (3.0 - 2.0 * t)
 
 
 @register_command("vignette")
@@ -1016,19 +1435,19 @@ class Vignette(IOCommand):
       --border (float):
           Controls the width of the fade gradient.
           Calculated as a % of the image's smallest dimension (Height or Width).
-          Example: 5.0 creates a fade that covers 5% of the image.
+          Example - 5.0 creates a fade that covers 5% of the image.
           **If 0, the input file is simply copied to the output.**
 
       --noise (float):
           Adds high-frequency "grain" (dithering) to the fade.
           Calculated as a % of the 'border' size.
-          Purpose: Hides digital banding and makes the gradient look smoother.
+          Purpose - Hides digital banding and makes the gradient look smoother.
 
       --warp (float):
           Adds low-frequency "wiggles" (fractal distortion) to the edge shape.
           Calculated as a % of the 'border' size.
-          Purpose: Breaks up straight lines, making the edge look organic.
-          Note: The visible image area shrinks slightly as warp increases to ensure edges remain
+          Purpose -  Breaks up straight lines, making the edge look organic.
+          Note -  The visible image area shrinks slightly as warp increases to ensure edges remain
           soft.
     """
 
@@ -1056,14 +1475,27 @@ class Vignette(IOCommand):
         parser.add_argument(
             "--seed", type=int, default=None,
             help="Optional RNG seed for reproducible vignette edges.", )
+        parser.add_argument(
+            "--fade-data", action="store_true",
+            help="Physically fade the data bands to black. Required for LandWeaver signals, "
+                 "but should be OFF for final visual overlays."
+        )
 
     def transform(self):
         import rasterio
         from scipy.ndimage import distance_transform_edt
         import shutil
+        from pathlib import Path
 
         input_path = self.args.input
         output_path = self.args.output
+
+        if self.args.border < 0:
+            raise ConfigurationError("--border cannot be negative.")
+        if self.args.noise < 0:
+            raise ConfigurationError("--noise cannot be negative.")
+        if self.args.warp < 0:
+            raise ConfigurationError("--warp cannot be negative.")
 
         # === 0. Bypass Check ===
         if self.args.border <= 0:
@@ -1071,219 +1503,399 @@ class Vignette(IOCommand):
             shutil.copy(input_path, output_path)
             return
 
-        # ✅ deterministic RNG (optional)
         rng = np.random.default_rng(self.args.seed)
 
-        # 1. Open Input to get Dimensions
+        # 1. Open Input
         with rasterio.open(input_path) as src:
             data = src.read()  # shape: (bands, h, w)
             profile = src.profile.copy()
-            height = int(src.height)
-            width = int(src.width)
+            height, width = int(src.height), int(src.width)
             bands = int(src.count)
 
-        # 2. Calculate Absolute Pixel Values from Percentages
+            # Extract existing alpha if it exists (the last band)
+            existing_alpha = data[-1].copy() if bands in (2, 4) else None
+
+        # 2. Calculate Absolute Pixel Values
         min_dim = min(height, width)
-
-        fade_pixels = int(min_dim * (self.args.border / 100.0))
-        fade_pixels = max(MIN_FADE_PIXELS, fade_pixels)
-
+        fade_pixels = max(MIN_FADE_PIXELS, int(min_dim * (self.args.border / 100.0)))
         noise_amt = int(fade_pixels * (self.args.noise / 100.0))
         warp_amt = int(fade_pixels * (self.args.warp / 100.0))
 
-        self.print_verbose(
-            f"Border: {self.args.border}% ({fade_pixels}px) , "
-            f"Warp: {self.args.warp}% ({warp_amt}px) , "
-            f"Noise: {self.args.noise}% ({noise_amt}px)"
-        )
+        # 3. Mask Generation (Frame Vignette)
+        mask = np.ones((height, width), dtype=np.uint8)
+        mask[0, :], mask[-1, :], mask[:, 0], mask[:, -1] = 0, 0, 0, 0
+        dist_grid = distance_transform_edt(mask).astype(np.float32)
 
-        # 3. Smart Mask Generation (defines “inside” for distance transform)
-        if bands in (2, 4):
-            existing_alpha = data[-1].astype(np.uint8, copy=False)
-            mask = (existing_alpha > 0).astype(np.uint8)
-        else:
-            existing_alpha = None
-            mask = np.ones((height, width), dtype=np.uint8)
-
-        # Force outermost border to be “outside”
-        mask[0, :] = 0
-        mask[-1, :] = 0
-        mask[:, 0] = 0
-        mask[:, -1] = 0
-
-        # Distance to nearest outside pixel
-        dist_grid = distance_transform_edt(mask).astype(np.float32, copy=False)
-
-        # 4. Fractal Warp Injection
+        # 4. Warp & 5. Noise
         if warp_amt > 0:
             base_scale = max(BASE_SCALE_MIN_PIXELS, float(fade_pixels) * 1.5)
-            fractal = self._generate_fractal_noise(height, width, base_scale, rng=rng)
-            # Safety shift so the warp mostly pulls inward near the fade band
+            fractal = generate_fractal_noise(height, width, base_scale, rng=rng)
             dist_grid += (fractal * float(warp_amt)) - float(warp_amt)
 
-        # 5. High-Freq Grain
         if noise_amt > 0:
-            grain = rng.uniform(0.0, float(noise_amt), (height, width)).astype(
-                np.float32, copy=False
-            )
-            dist_grid -= grain
+            dist_grid -= rng.uniform(0.0, float(noise_amt), (height, width))
 
-        # 6. Normalize to alpha byte
+        # 6. Normalize and Smooth
         dist_grid = np.clip(dist_grid, 0.0, float(fade_pixels))
         vignette_alpha = (dist_grid / float(fade_pixels)) * ALPHA_MAX
         vignette_alpha = np.round(vignette_alpha).clip(0, 255).astype(np.uint8)
 
-        # ✅ smooth the vignette a bit (helps banding on some sources)
         t = (vignette_alpha.astype(np.float32) / 255.0)
-        vignette_alpha = np.round(_smoothstep01(t) * 255.0).astype(np.uint8)
+        vignette_alpha = np.round(smoothstep01(t) * 255.0).astype(np.uint8)
 
-        # 7. Prepare Output data
-        out = data.copy()  # safer than mutating `data` in-place
+        #  Prepare Output data
+        out = data.copy()
+        v_fader = vignette_alpha.astype(np.float32) / 255.0
+
+        # Handle Data Bands
+        if self.args.fade_data:
+            # SIGNAL / PREMULTIPLIED MODE: Use this when the raster serves as a
+            # mathematical input for modeling, thresholding, or weighted blending.
+            # Physically dropping the pixel intensity to zero ensures that
+            # downstream calculations correctly interpret the vignette as a
+            # loss of signal influence rather than just visual transparency.
+            self.print_verbose("--- Fading data bands to black (Signal Mode) ---")
+            data_bands_count = bands - 1 if bands in (2, 4) else bands
+            for b in range(data_bands_count):
+                out[b] = np.round(out[b].astype(np.float32) * v_fader).astype(data.dtype)
+        else:
+            # VISUAL / STRAIGHT MODE: Use this for final map overlays and
+            # UI elements. RGB colors are preserved at full intensity, allowing
+            # the Alpha channel to handle transparency. This prevents dark
+            # "premultiplication" halos during standard browser or GPU rendering.
+            self.print_verbose("--- Preserving RGB colors (Visual Mode) ---")
+
+        # Handle Alpha Channel
         if bands in (2, 4):
             if self.args.replace_alpha:
                 out[-1] = vignette_alpha
             else:
-                # ✅ Default: preserve existing alpha by multiplying with vignette alpha
-                ea = existing_alpha.astype(np.uint16, copy=False)
-                va = vignette_alpha.astype(np.uint16, copy=False)
+                ea = existing_alpha.astype(np.uint16)
+                va = vignette_alpha.astype(np.uint16)
                 out[-1] = np.round((ea * va) / 255.0).astype(np.uint8)
         else:
             alpha_band = vignette_alpha[np.newaxis, :, :]
             out = np.concatenate([out, alpha_band], axis=0)
             profile.update({"count": bands + 1})
 
-        # Default-ish output settings
+        # Final Profile Update
+        out_count = out.shape[0]
         profile.update(
             {
-                "driver": "GTiff", "compress": "deflate", "tiled": True,
+                "driver": "GTiff", "compress": "deflate", "tiled": True, "nodata": 0
+                # Fallback hint for older software
             }
         )
 
-        # Apply User Overrides (e.g. COMPRESS=ZSTD)
-        if self.args.co:
-            for opt in self.args.co:
-                if "=" in opt:
-                    key, val = opt.split("=", 1)
-                    key = key.lower()
-                    profile[key] = int(val) if val.isdigit() else val
+        if out_count in (2, 4):
+            # ✅ EXPLICIT ALPHA FLAG: Tells GDAL/QGIS that the last band is Alpha
+            profile["alpha"] = "yes"
 
-        # --- Force valid tiling if tiled ---
-        if profile.get("tiled", False):
-            # Pick a standard tile size (must be multiples of 16)
-            TILE = 256  # or 512 for fewer blocks
-            profile["blockxsize"] = TILE
-            profile["blockysize"] = TILE
+        if profile.get("tiled"):
+            profile["blockxsize"], profile["blockysize"] = 256, 256
 
-        # Photometric must match band semantics
-        out_count = profile.get("count", out.shape[0])
-        if out_count in (1, 2):
-            # 1-band or gray+alpha
-            profile["photometric"] = "MINISBLACK"
-        else:
-            # RGB or RGBA
-            profile["photometric"] = "RGB"
+        # Photometric consistency
+        profile["photometric"] = "RGB" if out_count >= 3 else "MINISBLACK"
 
-        # Clean up and Write
+        # Write and Set Band Metadata
         Path(output_path).unlink(missing_ok=True)
         try:
             with rasterio.open(output_path, "w", **profile) as dst:
                 dst.write(out)
+
+                # ✅ SET EXPLICIT COLOR INTERPRETATION
+                # This ensures QGIS automatically enables transparency on load
+                from rasterio.enums import ColorInterp
+                if out_count == 4:
+                    dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue,
+                        ColorInterp.alpha]
+                elif out_count == 2:
+                    dst.colorinterp = [ColorInterp.gray, ColorInterp.alpha]
+                elif out_count == 3:
+                    dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue]
+                elif out_count == 1:
+                    dst.colorinterp = [ColorInterp.gray]
+
             self.print_verbose(f"✅ Created {output_path}")
+        except rasterio.errors.RasterioIOError as exc:
+            Path(output_path).unlink(missing_ok=True)
+            raise FileError(
+                f"Could not write raster '{output_path}': {exc}"
+            ) from exc
+
+        except OSError as exc:
+            Path(output_path).unlink(missing_ok=True)
+            raise FileError(
+                f"File error writing '{output_path}': {exc}"
+            ) from exc
+
         except Exception:
             Path(output_path).unlink(missing_ok=True)
             raise
 
-    def _generate_fractal_noise(
-            self, h: int, w: int, base_scale: float, rng: np.random.Generator,
-            octaves: int = DEFAULT_OCTAVES, ) -> np.ndarray:
-        """Generate low-frequency fractal noise in [-1..1] with deterministic RNG.
-
-        Args:
-            h: Height in pixels.
-            w: Width in pixels.
-            base_scale: Starting scale (larger => smoother).
-            rng: Numpy RNG generator.
-            octaves: Number of octaves.
-
-        Returns:
-            Noise field shaped (h, w), float32, roughly in [-1..1].
-        """
-        from scipy.ndimage import zoom
-
-        total_noise = np.zeros((h, w), dtype=np.float32)
-        amplitude = 1.0
-        max_possible_value = 0.0
-        current_scale = float(base_scale)
-
-        for _ in range(int(octaves)):
-            small_h = max(1, int(h / current_scale))
-            small_w = max(1, int(w / current_scale))
-
-            layer = rng.uniform(-1.0, 1.0, (small_h, small_w)).astype(np.float32, copy=False)
-
-            zoom_h = h / small_h
-            zoom_w = w / small_w
-
-            upscaled = zoom(layer, (zoom_h, zoom_w), order=3).astype(np.float32, copy=False)
-            upscaled = upscaled[:h, :w]
-
-            total_noise += upscaled * amplitude
-            max_possible_value += amplitude
-
-            amplitude *= 0.5
-            current_scale /= 2.0
-
-        denom = max_possible_value if max_possible_value > 0 else 1.0
-        return (total_noise / denom).astype(np.float32, copy=False)
-
-
-@register_command("create_mbtiles")
-class CreateMBTiles(IOCommand):
+@register_command("create_output_alpha")
+class CreateOutputAlpha(IOCommand):
     """
-    Converts a TIF to MBTiles.
+    Create a single-band uint8 alpha raster.
 
-    Optimization Strategy:
-    1. Generates temporary external overviews (.ovr) on the SOURCE file first.
-       This ensures downsampling happens from the lossless source, not a lossy intermediate.
-    2. Runs gdal_translate to populate the MBTiles database.
-       Because source overviews exist, gdal_translate uses them to create
-       lower zoom levels without compounding compression artifacts.
-    3. Patches the SQLite metadata table manually to ensure minzoom/maxzoom are correct.
+    The input raster is used only as a template for grid / CRS / transform.
+    The output contains:
+
+    - 255 everywhere when --border is 0
+    - a vignette alpha mask when --border > 0
     """
 
     @staticmethod
     def add_arguments(parser):
-        super(CreateMBTiles, CreateMBTiles).add_arguments(parser)
-
-        # 1. GDAL Pass-Throughs
-        parser.add_argument("--co", action="append", help="GDAL Creation Options")
-        parser.add_argument("--mo", action="append", help="GDAL Metadata Options")
-
-        # 2. Logic Options
+        super(CreateOutputAlpha, CreateOutputAlpha).add_arguments(parser)
         parser.add_argument(
-            "--min-zoom", type=int, help="Force 'minzoom' metadata in MBTiles."
+            "--border",
+            type=float,
+            default=5.0,
+            help="Fade width as a percentage of the smaller image dimension. Default: 5.0%%",
         )
         parser.add_argument(
-            "--max-zoom", type=int, help="Force 'maxzoom' metadata in MBTiles."
+            "--noise",
+            type=float,
+            default=20.0,
+            help="Noise amplitude as a percentage of fade width. Default: 20%%",
         )
-
-        # 3. Pyramid Options
-        parser.add_argument("-r", "--resampling", default="CUBIC", help="Resampling algo.")
-        parser.add_argument("--levels", nargs="+", default=["2", "4", "8", "16", "32", "64", "128"])
+        parser.add_argument(
+            "--warp",
+            type=float,
+            default=60.0,
+            help="Warp distortion as a percentage of fade width. Default: 60%%",
+        )
+        parser.add_argument(
+            "--seed",
+            type=int,
+            default=None,
+            help="Optional RNG seed for reproducible vignette edges.",
+        )
+        parser.add_argument(
+            "--co",
+            action="append",
+            help="Creation options for the output driver (e.g., 'COMPRESS=DEFLATE').",
+        )
 
     def transform(self):
+        from pathlib import Path
+
+        import rasterio
+        from rasterio.enums import ColorInterp
+        from scipy.ndimage import distance_transform_edt
+
+        input_path = self.args.input
+        output_path = self.args.output
+
+        if self.args.border < 0:
+            raise ConfigurationError("--border cannot be negative.")
+        if self.args.noise < 0:
+            raise ConfigurationError("--noise cannot be negative.")
+        if self.args.warp < 0:
+            raise ConfigurationError("--warp cannot be negative.")
+
+        rng = np.random.default_rng(self.args.seed)
+
+        # Open input only to inherit grid / CRS / transform / size
+        with rasterio.open(input_path) as src:
+            profile = src.profile.copy()
+            height, width = int(src.height), int(src.width)
+
+        # Output is always a single-band uint8 alpha raster
+        profile.update(
+            {
+                "driver": "GTiff",
+                "dtype": "uint8",
+                "count": 1,
+                "compress": "deflate",
+                "tiled": True,
+                "nodata": None,
+                "photometric": "MINISBLACK",
+            }
+        )
+
+        if profile.get("tiled"):
+            profile["blockxsize"] = 256
+            profile["blockysize"] = 256
+
+        if self.args.co:
+            for opt in self.args.co:
+                if "=" in opt:
+                    key, value = opt.split("=", 1)
+                    profile[key.lower()] = int(value) if value.isdigit() else value
+
+        # ------------------------------------------------------------------
+        # Create alpha mask
+        # ------------------------------------------------------------------
+        if self.args.border == 0:
+            # Fully opaque alpha everywhere
+            alpha_mask = np.full((height, width), ALPHA_MAX, dtype=np.uint8)
+            self.print_verbose("--- Border is 0%. Creating full opaque alpha mask. ---")
+        else:
+            min_dim = min(height, width)
+            fade_pixels = max(MIN_FADE_PIXELS, int(min_dim * (self.args.border / 100.0)))
+            noise_amt = int(fade_pixels * (self.args.noise / 100.0))
+            warp_amt = int(fade_pixels * (self.args.warp / 100.0))
+
+            # Base frame distance
+            mask = np.ones((height, width), dtype=np.uint8)
+            mask[0, :], mask[-1, :], mask[:, 0], mask[:, -1] = 0, 0, 0, 0
+            dist_grid = distance_transform_edt(mask).astype(np.float32)
+
+            # Low-frequency warp
+            if warp_amt > 0:
+                base_scale = max(BASE_SCALE_MIN_PIXELS, float(fade_pixels) * 1.5)
+                fractal = generate_fractal_noise(
+                    height,
+                    width,
+                    base_scale,
+                    rng=rng,
+                )
+                dist_grid += (fractal * float(warp_amt)) - float(warp_amt)
+
+            # High-frequency grain
+            if noise_amt > 0:
+                dist_grid -= rng.uniform(0.0, float(noise_amt), (height, width))
+
+            # Normalize and smooth
+            dist_grid = np.clip(dist_grid, 0.0, float(fade_pixels))
+            alpha_mask = (dist_grid / float(fade_pixels)) * ALPHA_MAX
+            alpha_mask = np.round(alpha_mask).clip(0, 255).astype(np.uint8)
+
+            t = alpha_mask.astype(np.float32) / 255.0
+            alpha_mask = np.round(smoothstep01(t) * 255.0).astype(np.uint8)
+
+        # ------------------------------------------------------------------
+        # Write output
+        # ------------------------------------------------------------------
+
+        out = alpha_mask[np.newaxis, :, :]
+
+        Path(output_path).unlink(missing_ok=True)
+        try:
+            with rasterio.open(output_path, "w", **profile) as dst:
+                dst.write(out)
+                dst.colorinterp = [ColorInterp.gray]
+
+            self.print_verbose(f"✅ Created alpha mask: {output_path}")
+
+        except rasterio.errors.RasterioIOError as exc:
+            Path(output_path).unlink(missing_ok=True)
+            raise FileError(
+                f"Could not write raster '{output_path}': {exc}"
+            ) from exc
+
+        except OSError as exc:
+            Path(output_path).unlink(missing_ok=True)
+            raise FileError(
+                f"File error writing '{output_path}': {exc}"
+            ) from exc
+
+        except Exception:
+            Path(output_path).unlink(missing_ok=True)
+            raise
+
+@register_command("create_mbtiles")
+class CreateMBTiles(IOCommand):
+    @staticmethod
+    def add_arguments(parser):
+        super(CreateMBTiles, CreateMBTiles).add_arguments(parser)
+        parser.add_argument("--co", action="append", help="GDAL Creation Options")
+        parser.add_argument("--mo", action="append", help="GDAL Metadata Options")
+        parser.add_argument("--minzoom", type=int, help="Minimum zoom level")
+        parser.add_argument("--maxzoom", type=int, help="Maximum zoom level")
+        parser.add_argument("-r", "--resampling", default="CUBIC", help="Resampling algo.")
+
+    def transform(self):
+        import time
+
+        levels = self.calculate_levels()
+        start = time.perf_counter()
+        phase_start = time.perf_counter()
         self.run_mbtiles()
-        self.run_gdaladdo()
+        mbtiles_time = time.perf_counter() - phase_start
+        self.print_verbose(f"⏱️ Base MBTiles: {mbtiles_time:.2f}s")
+
+        if levels:
+            phase_start = time.perf_counter()
+            self.run_gdaladdo(levels)
+            overview_time = time.perf_counter() - phase_start
+            self.print_verbose(f"⏱️ Overviews: {overview_time:.2f}s")
+
+        phase_start = time.perf_counter()
+        self.patch_metadata()
+        metadata_time = time.perf_counter() - phase_start
+        self.print_verbose(f"⏱️ Metadata: {metadata_time:.2f}s")
+
+        total_time = time.perf_counter() - start
+        self.print_verbose(f"⏱️ Total MBTiles: {total_time:.2f}s")
+
+    def calculate_levels(self) -> List[str]:
+        """Calculates power-of-two levels based on zoom range."""
+
+        # Auto-calculate if both zooms are provided
+        if False: #self.args.minzoom is not None and self.args.maxzoom is not None:
+            diff = self.args.maxzoom - self.args.minzoom
+            if diff <= 0:
+                return []
+
+            # Generate [2, 4, 8, 16, ...] up to the zoom difference
+            return [str(2 ** i) for i in range(1, diff + 1)]
+
+        # Fallback to a safe default if no zoom info is provided
+        return ["2", "4", "8", "16"]
+
+    def run_gdaladdo(self, levels: List[str]):
+        self.print_verbose(
+            f"--- Adding Overviews ({self.args.resampling}) | Levels: {' '.join(levels)} ---"
+            )
+        cmd = ["gdaladdo", "-r", self.args.resampling, self.args.output] + levels
+        self._run_command(cmd)
+
+    def patch_metadata(self):
+        """
+        Make minzoom/maxzoom metadata exactly match the tile pyramid.
+
+        GDAL may already have written these keys, so delete all existing rows
+        before inserting the authoritative values.
+        """
+        import sqlite3
+
+        minzoom = self.args.minzoom
+        maxzoom = self.args.maxzoom
+
+        conn = sqlite3.connect(self.args.output)
+        try:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "DELETE FROM metadata WHERE name IN ('minzoom', 'maxzoom')"
+            )
+
+            cursor.execute(
+                "INSERT INTO metadata (name, value) VALUES ('minzoom', ?)",
+                (str(minzoom),),
+            )
+            cursor.execute(
+                "INSERT INTO metadata (name, value) VALUES ('maxzoom', ?)",
+                (str(maxzoom),),
+            )
+
+            conn.commit()
+            print(f"Set MBTiles metadata zoom range: {minzoom}–{maxzoom}")
+        finally:
+            conn.close()
+
+
 
     def run_mbtiles(self):
         layer_name = Path(self.args.output).stem
         self.print_verbose(f"--- Generating MBTiles ({self.args.output}) ---")
 
-        # Base Command
         cmd = ["gdal_translate", "-of", "MBTiles", "-mo", f"name={layer_name}", "-mo",
-               "type=overlay", ]
+               "type=overlay"]
 
-        # Inject User Options (Only valid -co flags should be here now)
         if self.args.co:
             for opt in self.args.co:
                 cmd.extend(["-co", opt])
@@ -1293,44 +1905,7 @@ class CreateMBTiles(IOCommand):
                 cmd.extend(["-mo", opt])
 
         cmd.extend([self.args.input, self.args.output])
-
-        try:
-            self._run_command(cmd)
-            self.print_verbose(f"✅ Created MBTiles: {self.args.output}")
-        except Exception:
-            Path(self.args.output).unlink(missing_ok=True)
-            raise
-
-    def run_gdaladdo(self):
-        # Force BILINEAR. It is the safest for re-compressing noisy data.
-        cmd = ["gdaladdo", "-r", "BILINEAR", self.args.output] + self.args.levels
         self._run_command(cmd)
-
-    def patch_metadata(self):
-        import sqlite3
-
-        if self.args.min_zoom or self.args.max_zoom:
-            self.print_verbose("--- Patching Metadata ---")
-            conn = sqlite3.connect(self.args.output)
-            cursor = conn.cursor()
-
-            # DELETE duplicates first to avoid confusion
-            if self.args.min_zoom:
-                cursor.execute("DELETE FROM metadata WHERE name='minzoom'")
-                cursor.execute(
-                    "INSERT INTO metadata (name, value) VALUES ('minzoom', ?)",
-                    (self.args.min_zoom,)
-                )
-
-            if self.args.max_zoom:
-                cursor.execute("DELETE FROM metadata WHERE name='maxzoom'")
-                cursor.execute(
-                    "INSERT INTO metadata (name, value) VALUES ('maxzoom', ?)",
-                    (self.args.max_zoom,)
-                )
-
-            conn.commit()
-            conn.close()
 
 
 @register_command("create_pmtiles")
@@ -1346,10 +1921,6 @@ class CreatePMTiles(IOCommand):
         )  # Add any specific pmtiles args here if needed in the future
 
     def transform(self):
-        self.print_verbose(
-            f"--- Converting '{self.args.input}' to PMTiles ({self.args.output}) ---"
-        )
-
         # Ensure input is actually an mbtiles file to avoid confused tool output
         if not self.args.input.endswith(".mbtiles"):
             self.print_verbose("⚠️  Warning: Input file does not have .mbtiles extension.")
@@ -1357,13 +1928,8 @@ class CreatePMTiles(IOCommand):
         # pmtiles convert input.mbtiles output.pmtiles
         cmd = ["pmtiles", "convert", self.args.input, self.args.output]
 
-        try:
-            self._run_command(cmd)
-            self.print_verbose(f"✅ Created PMTiles: {self.args.output}")
-        except FileNotFoundError:
-            print("❌ Error: 'pmtiles' executable not found in PATH.")
-            print("   Please install it from: https://github.com/protomaps/go-pmtiles")
-            raise
+        self._run_command(cmd)
+        self.print_verbose(f"✅ Created PMTiles: {self.args.output}")
 
 
 @register_command("run")
@@ -1383,10 +1949,8 @@ class Run(Command):
 
     def execute(self):
         if not self.args.gdal_cmd:
-            print("❌ Error: No command provided to run.")
-            return
+            raise ConfigurationError("No command provided to run.")
 
-        # self._run_command will handle the logging and the CoOptions validation
         self._run_command(self.args.gdal_cmd)
 
 
@@ -1404,50 +1968,24 @@ class ValidateRaster(Command):
             "--min-bytes", type=int, default=1000,
             help="Minimum file size in bytes (Default: 1000)."
         )
-        parser.add_argument(
-            "--min-pixels", type=int, default=1000,
-            help="Minimum TOTAL pixels (Width * Height). Default: 1000."
-        )
+
 
     def execute(self):
-        # Lazy import
-        import rasterio
 
         input_file = self.args.input
         min_bytes = self.args.min_bytes
-        min_pixels = self.args.min_pixels
 
         if not os.path.exists(input_file):
-            raise FileNotFoundError(f"❌ Validation Failed: File not found: {input_file}")
+            raise FileError(f"Validation failed: file not found: '{input_file}'")
 
         # 1. Check File Size (Bytes)
         file_size = os.path.getsize(input_file)
         if file_size < min_bytes:
-            raise ValueError(
-                f"❌ Validation Failed: File size is too small.\n"
+            raise ConfigurationError(
+                f"Validation failed: file size is too small.\n"
                 f"   File: {input_file}\n"
                 f"   Size: {file_size} bytes\n"
                 f"   Minimum: {min_bytes} bytes"
-            )
-
-        # 2. Check Total Pixels (Rasterio)
-        try:
-            with rasterio.open(input_file) as src:
-                width = src.width
-                height = src.height
-                total_pixels = width * height
-
-                if total_pixels < min_pixels:
-                    raise ValueError(
-                        f"❌ Validation Failed: Image area is too small.\n"
-                        f"   File: {input_file}\n"
-                        f"   Dimensions: {width}x{height} ({total_pixels} pixels)\n"
-                        f"   Minimum Area: {min_pixels} pixels"
-                    )
-
-        except rasterio.errors.RasterioIOError:
-            raise ValueError(
-                f"❌ Validation Failed: File exists but is not a valid raster: {input_file}"
             )
 
 
@@ -1464,16 +2002,24 @@ class ProximityTool(IOCommand):
         parser.add_argument(
             "--targets", type=str, default="0,1,2,3,5,6",
             help="Comma-separated list of target IDs (Land)"
-            )
+        )
         parser.add_argument(
             "--maxdist", type=float, default=None,
             help="Maximum distance to calculate (pixels). Caps values and optimizes compression."
-            )
+        )
 
     def transform(self):
         import rasterio
         from scipy.ndimage import distance_transform_edt
-        target_ids = [int(i.strip()) for i in self.args.targets.split(",")]
+        try:
+            target_ids = [int(i.strip()) for i in self.args.targets.split(",")]
+        except ValueError as exc:
+            raise ConfigurationError(
+                "--targets must contain comma-separated integer IDs."
+            ) from exc
+
+        if self.args.maxdist is not None and self.args.maxdist < 0:
+            raise ConfigurationError("--maxdist cannot be negative.")
 
         with rasterio.open(self.args.input) as src:
             self.print_verbose(f"📏 Calculating proximity: {src.width}x{src.height}")
@@ -1504,7 +2050,3 @@ class ProximityTool(IOCommand):
                 dst.write(dist_map, 1)
 
         self.print_verbose(f"✅ Created Proximity Driver: {self.args.output}")
-
-
-# Point to the registry populated by the decorators
-COMMANDS = COMMAND_REGISTRY

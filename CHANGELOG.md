@@ -1,0 +1,3 @@
+- 1.4 [FEAT] Added Haze and Smooth commands. Renamed blur command to feather
+- 1.5 [FEAT] Added new command 'lookup_raster'. Improved error handling.
+- 1.6 [FEAT] Added new commands 'create_dem' and 'broad_hillshade'.

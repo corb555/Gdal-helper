@@ -9,12 +9,9 @@ import rasterio
 
 
 def any_ids_west_of_x(
-        src_path: Path,
-        ids: Iterable[int],
-        *,
-        x_cutoff_src_crs: float,
-        max_blocks: int = 2000,
-) -> Set[int]:
+        src_path: Path, ids: Iterable[int], *, x_cutoff_src_crs: float, max_blocks: int = 2000,
+) -> \
+Set[int]:
     """Return which IDs are seen west of a source-CRS x cutoff.
 
     Args:

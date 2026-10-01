@@ -1,10 +1,11 @@
 import os
 import subprocess
-import pytest
-import rasterio
 
 # Import your functions
 from GDALHelper.git_utils import get_git_hash, set_tiff_version, get_tiff_version
+import pytest
+import rasterio
+
 
 @pytest.fixture
 def temp_git_repo(tmp_path):
@@ -33,7 +34,9 @@ def temp_git_repo(tmp_path):
     # 5. Cleanup: Switch back after test
     os.chdir(original_cwd)
 
+
 import numpy as np  # <--- Import numpy here
+
 
 @pytest.fixture
 def sample_tiff(temp_git_repo):
@@ -42,14 +45,15 @@ def sample_tiff(temp_git_repo):
 
     # Create a 10x10 dummy image
     profile = {
-        'driver': 'GTiff',
-        'height': 10, 'width': 10, 'count': 1, 'dtype': 'uint8'
+        'driver': 'GTiff', 'height': 10, 'width': 10, 'count': 1, 'dtype': 'uint8'
     }
     with rasterio.open(filename, 'w', **profile) as dst:
         # Use np.zeros directly
         dst.write(np.zeros((1, 10, 10), dtype='uint8'))
 
     return str(filename)
+
+
 # ==========================================
 # THE TESTS
 # ==========================================
@@ -60,6 +64,7 @@ def test_get_git_hash_clean(temp_git_repo):
     assert len(git_hash) == 40  # Standard SHA-1 length
     assert "dirty" not in git_hash
 
+
 def test_get_git_hash_dirty(temp_git_repo):
     """Test retrieving hash from a dirty repo."""
     # Modify a file to make repo dirty
@@ -67,6 +72,7 @@ def test_get_git_hash_dirty(temp_git_repo):
 
     git_hash = get_git_hash()
     assert git_hash.endswith("-dirty")
+
 
 def test_set_and_get_tiff_version(temp_git_repo, sample_tiff):
     """Test the full cycle: Get Hash -> Stamp Tiff -> Read Tiff."""

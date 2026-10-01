@@ -1,21 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
 
 from GDALHelper.qml_palette import DEFAULT_LUT_SIZE, load_qml_palette
 import numpy as np
 
-
-
 EXPECTED = {
-    0: ("#000000", 0),
-    1: ("#574d42", 255),
-    2: ("#625e5a", 255),
-    3: ("#e3dbca", 255),
-    4: ("#3a404a", 255),
-    5: ("#edeff0", 255),
-    6: ("#e3dbca", 255),
+    0: ("#000000", 0), 1: ("#574d42", 255), 2: ("#625e5a", 255), 3: ("#e3dbca", 255),
+    4: ("#3a404a", 255), 5: ("#edeff0", 255), 6: ("#e3dbca", 255),
 }
 
 

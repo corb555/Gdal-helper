@@ -1,6 +1,5 @@
-import pytest
-
 from GDALHelper.color_ramp_hsv import adjust_hsv
+import pytest
 
 
 # Helper to convert from degrees (0-360) to the function's normalized format (0-1)
@@ -35,7 +34,8 @@ ADJUST_HSV_TEST_CASES = [("no_change", h(120), 0.8, 0.7,  # A bright green color
                           ), ("simple_hue_shift_in_range", h(100), 0.8, 0.5,  # A saturated green
                               1.0, 0.0, 0.0, 0.0, 90, 150, 120,
                               # Range: green->cyan, Target: a bluer green
-                              # Expected: hue shifts towards target. Math: fade=1. h=0.277, th=0.333. diff=0.056. new_h=0.333
+                              # Expected: hue shifts towards target. Math: fade=1. h=0.277,
+                              # th=0.333. diff=0.056. new_h=0.333
                               (h(120), 0.8, 0.5)),
                          ("no_hue_shift_outside_range", h(30), 0.8, 0.5,  # An orange color
                           1.0, 0.0, 0.0, 0.0, 90, 150, 120,  # Range: green->cyan
@@ -53,7 +53,8 @@ ADJUST_HSV_TEST_CASES = [("no_change", h(120), 0.8, 0.7,  # A bright green color
 
 
 @pytest.mark.parametrize(
-    "test_id, h_in, s_in, v_in, sat_mult, sh_adj, mid_adj, hi_adj, min_hue, max_hue, target_hue, expected_hsv",
+    "test_id, h_in, s_in, v_in, sat_mult, sh_adj, mid_adj, hi_adj, min_hue, max_hue, target_hue, "
+    "expected_hsv",
     ADJUST_HSV_TEST_CASES, ids=[case[0] for case in ADJUST_HSV_TEST_CASES]
     # Use test_id for readable report
 )

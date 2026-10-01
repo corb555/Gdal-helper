@@ -5,7 +5,6 @@ from typing import Dict, Optional, List
 from GDALHelper.biome_config import SurfaceKey, _BlendSpec
 import numpy as np
 
-
 # -------------------------------------------------------------------------
 # Blending
 # -------------------------------------------------------------------------
@@ -97,12 +96,11 @@ Notes:
     - Ensure `factors[spec.factor_nm]` exists for each stage and has the correct
       semantic type (weight vs multiplier) to avoid surprising results.
 """
+
+
 def _blend_pixels(
-        self,
-        c: Dict[SurfaceKey, np.ndarray],
-        factors: FactorResult,
-        pipeline: Optional[List[_BlendSpec]] = None,
-) -> np.ndarray:
+        self, c: Dict[SurfaceKey, np.ndarray], factors: FactorResult,
+        pipeline: Optional[List[_BlendSpec]] = None, ) -> np.ndarray:
     """Composite per-pixel colors using a validated sequential blend pipeline.
 
     Args:
@@ -125,10 +123,12 @@ def _blend_pixels(
 
     def _step_ctx(i: int, spec: _BlendSpec) -> str:
         return (
-            f"pipeline item {i}\n kind={spec.comp_op!r} factor={getattr(spec, 'factor_nm', None)!r} "
-            f"source_a={getattr(spec, 'source_a', None)!r} source_b={getattr(spec, 'source_b', None)!r} "
-            f"target={getattr(spec, 'target', None)!r} output_key={getattr(spec, 'output_key', None)!r}"
-        )
+            f"pipeline item {i}\n kind={spec.comp_op!r} factor="
+            f"{getattr(spec, 'factor_nm', None)!r} "
+            f"source_a={getattr(spec, 'source_a', None)!r} source_b="
+            f"{getattr(spec, 'source_b', None)!r} "
+            f"target={getattr(spec, 'target', None)!r} output_key="
+            f"{getattr(spec, 'output_key', None)!r}")
 
     def _require(name: str, val: object, *, i: int, spec: _BlendSpec) -> None:
         if val is None:
@@ -137,7 +137,7 @@ def _blend_pixels(
     def _get_palette(key: object, fallback: np.ndarray, *, i: int, spec: _BlendSpec) -> np.ndarray:
         """Resolve a palette from active_palettes by key, or raise with context."""
         pal = active_palettes.get(key, None)
-        if pal is False: #None:
+        if pal is False:  # None:
             # If the caller provided a string key (like "soil_mix"), show known palette keys.
             keys = ", ".join(str(k) for k in sorted(active_palettes.keys(), key=lambda x: str(x)))
             raise ValueError(
@@ -149,8 +149,8 @@ def _blend_pixels(
 
     def _validate_img(img: np.ndarray, *, name: str, i: int, spec: _BlendSpec) -> None:
         if img is None:
-            return False
-            #raise ValueError(f"_blend_pixels(): {name} is None for {_step_ctx(i, spec)}.")
+            return False  # raise ValueError(f"_blend_pixels(): {name} is None for {_step_ctx(i,
+            # spec)}.")
         if not isinstance(img, np.ndarray) or img.ndim != 3 or img.shape[2] not in (3, 4):
             return False
             """raise ValueError(
@@ -181,10 +181,10 @@ def _blend_pixels(
 
     for i, spec in enumerate(pipeline):
         # Factor rules: multiply defaults to 1s in caller logic; others default to 0 is NOT safe.
-        #factor = _require_factor(spec.factor_nm, i=i, spec=spec)
-        #if not self.cfg.effect_on(spec.name):
+        # factor = _require_factor(spec.factor_nm, i=i, spec=spec)
+        # if not self.cfg.effect_on(spec.name):
         #    continue
-        if spec.factor_nm not in factors: continue # SKIP
+        if spec.factor_nm not in factors: continue  # SKIP
         factor = factors.get(spec.factor_nm)
 
         if spec.comp_op == "mix_palettes":
@@ -201,7 +201,7 @@ def _blend_pixels(
                 mixed = pA
 
             active_palettes[spec.output_key] = mixed
-            continue # Done with this step
+            continue  # Done with this step
 
         # --- SKIP OTHER STEPS IF FACTOR MISSING ---
         if factor is None:
@@ -210,19 +210,28 @@ def _blend_pixels(
         elif spec.comp_op == "init":
             if current_img is not None:
                 raise ValueError(
-                    f"_blend_pixels(): 'init' encountered but current_img already set at {_step_ctx(i, spec)}."
+                    f"_blend_pixels(): 'init' encountered but current_img already set at "
+                    f"{_step_ctx(i, spec)}."
                 )
             _require("spec.source_a", spec.palette_a, i=i, spec=spec)
 
             p_source = _get_palette(spec.palette_a, veg, i=i, spec=spec)
             p_target = _get_palette(spec.target, p_source, i=i, spec=spec)
             if not _validate_img(p_source, name="p_start", i=i, spec=spec):
-                raise ValueError(f"❌ Error: Blend Action={spec.comp_op}: invalid source_a: '{spec.palette_a}' Val={p_source}")
+                raise ValueError(
+                    f"❌ Error: Blend Action={spec.comp_op}: invalid source_a: '{spec.palette_a}' "
+                    f"Val={p_source}"
+                    )
             if not _validate_img(p_target, name="p_target", i=i, spec=spec):
-                raise ValueError(f"❌ Error: Blend Action={spec.comp_op}: invalid target: '{spec.target}' Val={p_target}")
+                raise ValueError(
+                    f"❌ Error: Blend Action={spec.comp_op}: invalid target: '{spec.target}' Val="
+                    f"{p_target}"
+                    )
 
             if not _validate_compat(p_source, p_target, i=i, spec=spec):
-                raise ValueError(f"❌ Error: Blend Action={spec.comp_op}: source and target are different sizes")
+                raise ValueError(
+                    f"❌ Error: Blend Action={spec.comp_op}: source and target are different sizes"
+                    )
 
             current_img = self._lerp_static(p_source, p_target, factor)
 
@@ -269,5 +278,3 @@ def _blend_pixels(
     _validate_img(current_img, name="current_img (final)", i=len(pipeline) - 1, spec=pipeline[-1])
 
     return np.round(current_img.transpose(2, 0, 1)).clip(0, 255).astype("uint8")
-
-

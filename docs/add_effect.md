@@ -1,23 +1,26 @@
-# Biome Processor -  Add `tree_line` Effect 
+# Biome Processor - Add `tree_line` Effect
 
-This document describes the steps to add a new effect called **`tree_line`** to the 
+This document describes the steps to add a new effect called **`tree_line`** to the
 biome creation system. To add a new effect you need to modify biome_config and
 biome_processor.
 
 ## A) Update `biome_config`
-`biome_config` is  the centralized authority for:
+
+`biome_config` is the centralized authority for:
+
 - effect names and defaults
 - required driver rasters derived from enabled effects
 - required palettes derived from enabled effects
 - missing requirement messages that include _why_ something is required
 - tuning blocks available under `drivers:` in YAML
 
-This case study adds **tree_line**, an effect that **increases rock exposure** above a 
+This case study adds **tree_line**, an effect that **increases rock exposure** above a
 configurable elevation.
 
 ## 1) Effect Definition
 
 ### Behavior (what the effect will do  in `BiomeProcessor`)
+
 - When `tree_line` is enabled, it produces a rock-weight contribution:
     - `W_tree = 0` at `elev <= tree_line.elev`
     - ramps to `W_tree = 1` at `elev >= tree_line.elev + tree_line.ramp`
@@ -26,6 +29,7 @@ configurable elevation.
 ## 2) Update `biome_schema.py` (Schema)
 
 ### 2.1 Add the effect flag under `enabled.effects`
+
 Find the `enabled.effects` schema and add:
 
 - key: `tree_line`
@@ -55,7 +59,6 @@ drivers:
     ramp: 200
  ```
 
-
 ####Schema requirements:
 
 drivers.tree_line.elev: float (or integer allowed if you prefer), default e.g. 3200.0
@@ -64,7 +67,8 @@ drivers.tree_line.ramp: float, default e.g. 200.0, should be positive (min > 0 i
 
 Cerberus schema change (conceptual):
 
-Add "tree_line": {"type": "dict", "required": False, "schema": {"elev": {...}, "ramp": {...}}} under BIOME_SCHEMA["drivers"]["schema"]
+Add "tree_line": {"type": "dict", "required": False, "schema": {"elev": {...}, "ramp": {...}}} under
+BIOME_SCHEMA["drivers"]["schema"]
 
 Important design rule:
 Do not add "enabled" inside drivers.tree_line. The enable switch lives only in enabled.effects.
@@ -91,15 +95,16 @@ Example output line format:
 ✅ TREE_LINE rock boost (elev=3200m, ramp=200m)
 
 
->Implementation notes:
+> Implementation notes:
 
->Use self.effect_on(EffectKey.TREE_LINE.value) to check enabled
+> Use self.effect_on(EffectKey.TREE_LINE.value) to check enabled
 
->Use self.driver("tree_line") to read tuning values (Cerberus defaults ensure presence)
+> Use self.driver("tree_line") to read tuning values (Cerberus defaults ensure presence)
 
 ###3.3 Update required_drivers() to include tree_line dependencies
 
-tree_line is elevation-driven using the DEM window (no extra raster), so it does not require new driver rasters beyond the always-required DEM.
+tree_line is elevation-driven using the DEM window (no extra raster), so it does not require new driver rasters beyond
+the always-required DEM.
 
 Therefore:
 
@@ -180,4 +185,5 @@ either files.rock and files.rock_red, OR
 files.palettes_yml present so rock palettes can be derived
 
 ## B) Update `biome_processor`
+
 > to come
